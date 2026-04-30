@@ -11,10 +11,13 @@
 <link rel="icon" href="data:," />
 <!-- coi-serviceworker injects Cross-Origin-Opener-Policy:same-origin
      and Cross-Origin-Embedder-Policy:require-corp into responses on
-     this origin. Required for SharedArrayBuffer (which z3-solver's
-     WASM threading needs). On the github-pages-served deploy at
-     heartpunk.github.io/mxoq/ this enables in-browser z3 simplify;
-     on other origins (gisthost, etc.) the SW scopes don't apply. -->
+     this origin via a service worker. Required for SharedArrayBuffer
+     (which z3-solver's WASM threading needs). On the github-pages
+     deploy at heartpunk.github.io/mxoq/ this enables in-browser z3
+     simplify; on other origins (gisthost, etc.) the SW scopes don't
+     apply and z3 will fail to init — simplify silently degrades.
+     Ships alongside imark.html — if absent the script-tag 404s
+     harmlessly and z3 simplify is just unavailable. -->
 <script src="coi-serviceworker.min.js"></script>
 <style>
 :root {
@@ -2396,6 +2399,221 @@ function composeChainGuard(transitions) {
   return '(and ' + conjuncts.join(' ') + ')';
 }
 
+// =====================================================================
+// Z3 simplify (lazy-loaded). Runs the composed-sub through z3-solver
+// to collapse nested (bvadd C1 (bvadd C2 x)) → (bvadd (C1+C2) x),
+// drop tautological asserts, fold ITEs, etc.
+//
+// Loading strategy (sophie 2026-04-29 evening):
+//   1. classic <script> tag for the emscripten module from jsdelivr's
+//      direct path (sets globalThis.initZ3) — this works at any
+//      origin without ESM-rewriting.
+//   2. dynamic ESM import of the high-level wrapper from esm.sh —
+//      esm.sh handles z3-solver's complex dep tree (async-mutex +
+//      WASM worker structure) where jsdelivr's +esm rewriter chokes.
+//   3. await mod.init() — brings up the Z3 context.
+//
+// Cross-Origin requirements: SharedArrayBuffer (which z3's WASM
+// threading needs) requires Cross-Origin-Opener-Policy:same-origin
+// + Cross-Origin-Embedder-Policy:require-corp on the page. The
+// coi-serviceworker.min.js script-tag in <head> injects these via
+// a service worker on origins where SW registration is in scope
+// (heartpunk.github.io/mxoq/ — the github-pages mirror — works;
+// the gisthost-served version no-ops because we don't control its
+// service worker scope, so simplify is a github-pages-only feature).
+//
+// Total cold-load: ~10MB WASM blob, ~3-4s on broadband. Cached in
+// browser after first load. Lazy-loaded only on first simplify
+// click so initial page load isn't impacted.
+// =====================================================================
+let _z3CachePromise = null;
+async function loadZ3() {
+  if (_z3CachePromise) return _z3CachePromise;
+  _z3CachePromise = (async () => {
+    // Step 1: classic script from jsdelivr's direct file path. Sets
+    // globalThis.initZ3 as a side effect. Loaded as a regular
+    // <script> tag (not ESM) so emscripten's module bootstrap works.
+    if (typeof globalThis.initZ3 !== 'function') {
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/z3-solver@latest/build/z3-built.js';
+        s.onload = () => res();
+        s.onerror = () => rej(new Error('failed to load z3-built.js from jsdelivr'));
+        document.head.appendChild(s);
+      });
+    }
+    // Step 2: import the high-level wrapper from esm.sh. The wrapper
+    // looks up globalThis.initZ3 and bootstraps the Z3 context.
+    const mod = await import('https://esm.sh/z3-solver/build/browser');
+    const z3p = await mod.init();
+    return z3p;
+  })();
+  return _z3CachePromise;
+}
+
+// Architectural-state variable sorts as declared by pyvex's emit. Used
+// when building the SMT-LIB declaration prefix for parsing composed
+// expressions. Anything not in this map is assumed (_ BitVec 64).
+const Z3_VAR_SORTS = {
+  rsp: '(_ BitVec 64)', rip: '(_ BitVec 64)',
+  rbp: '(_ BitVec 64)', rax: '(_ BitVec 64)',
+  rbx: '(_ BitVec 64)', rcx: '(_ BitVec 64)',
+  rdx: '(_ BitVec 64)', rdi: '(_ BitVec 64)',
+  rsi: '(_ BitVec 64)',
+  r8: '(_ BitVec 64)', r9: '(_ BitVec 64)',
+  r10: '(_ BitVec 64)', r11: '(_ BitVec 64)',
+  r12: '(_ BitVec 64)', r13: '(_ BitVec 64)',
+  r14: '(_ BitVec 64)', r15: '(_ BitVec 64)',
+  mem: '(Array (_ BitVec 64) (_ BitVec 8))',
+  rflags_CF: '(_ BitVec 1)', rflags_PF: '(_ BitVec 1)',
+  rflags_AF: '(_ BitVec 1)', rflags_ZF: '(_ BitVec 1)',
+  rflags_SF: '(_ BitVec 1)', rflags_OF: '(_ BitVec 1)',
+};
+
+// Best-effort sort inference for the result variable. The expression's
+// outermost form usually determines the sort: hex literal width,
+// store_le → array, _ extract i j → BitVec(i-j+1). Falls back to
+// BitVec64. Only used when the result var isn't itself in
+// Z3_VAR_SORTS (which it usually is, since composed-sub keys are
+// architectural-state vars).
+function inferZ3ResultSort(exprText) {
+  const t = (exprText || '').trim();
+  // Hex bv literal — width is (length - 2) hex chars * 4 bits.
+  const hexMatch = t.match(/^#x([0-9a-fA-F]+)$/);
+  if (hexMatch) return `(_ BitVec ${hexMatch[1].length * 4})`;
+  // Bv literal in (_ bv N W) form — extract W.
+  const bvMatch = t.match(/^\(_\s*bv\d+\s+(\d+)\s*\)$/);
+  if (bvMatch) return `(_ BitVec ${bvMatch[1]})`;
+  // Memory store/load — array sort.
+  if (t.startsWith('(store_le') || t === 'mem') {
+    return '(Array (_ BitVec 64) (_ BitVec 8))';
+  }
+  // Extract — width = hi - lo + 1.
+  const extractMatch = t.match(/^\(\(_\s+extract\s+(\d+)\s+(\d+)\)/);
+  if (extractMatch) {
+    const hi = parseInt(extractMatch[1]), lo = parseInt(extractMatch[2]);
+    return `(_ BitVec ${hi - lo + 1})`;
+  }
+  // Boolean ops.
+  if (/^\((and|or|not|=|distinct|ite)\b/.test(t)) {
+    // ITE could be any sort — fall through to default.
+    if (t.startsWith('(ite')) return '(_ BitVec 64)';
+    return 'Bool';
+  }
+  // Lookup if it's a known var name.
+  if (Z3_VAR_SORTS[t]) return Z3_VAR_SORTS[t];
+  // Default.
+  return '(_ BitVec 64)';
+}
+
+// Simplify each value in a composed-sub via z3.
+// Returns { var: simplified-expression-string }.
+async function simplifyComposedSub(composedSub) {
+  const z3p = await loadZ3();
+  const { Context } = z3p;
+  // Fresh per-call context so repeated calls don't leak decls/assertions.
+  const ctx = Context('mxoq_simp_' + Date.now());
+  const declsPrefix = Object.entries(Z3_VAR_SORTS)
+    .map(([n, s]) => `(declare-fun ${n} () ${s})`)
+    .join('\n');
+  const out = {};
+  for (const v of Object.keys(composedSub)) {
+    const exprText = composedSub[v];
+    const sort = Z3_VAR_SORTS[v] || inferZ3ResultSort(exprText);
+    // Wrap as (assert (= __r__ <expr>)) so we can extract the
+    // expression as the assertion's RHS, then simplify it.
+    const script = `${declsPrefix}\n(declare-fun __r__ () ${sort})\n(assert (= __r__ ${exprText}))`;
+    try {
+      const ast = ctx.ast_from_string(script);
+      const rhs = ast.arg(1);
+      const simplified = await ctx.simplify(rhs);
+      out[v] = simplified.toString();
+    } catch (e) {
+      console.warn('z3 simplify failed for', v, ':', e);
+      out[v] = `[simplify error: ${e.message}] ${exprText}`;
+    }
+  }
+  return out;
+}
+
+// Wire the "Simplify with Z3" button rendered by the live-composed
+// section in imark-range detail. On click: lazy-load z3, simplify
+// each composed-sub field + the composed guard, replace the rendered
+// row values + guard <pre> in place. Idempotent: clicking again
+// re-simplifies (cheap if already loaded).
+function wireZ3SimplifyButton(rootEl, payload) {
+  const btn = rootEl.querySelector('[data-action="z3-simplify"]');
+  if (!btn) return;
+  const status = rootEl.querySelector('.z3-simplify-status');
+  const subRegion = rootEl.querySelector('[data-region="composed-sub"]');
+  const guardRegion = rootEl.querySelector('[data-region="composed-guard"]');
+  const subLabelRegion = rootEl.querySelector('[data-region="composed-sub-label"]');
+  if (!subRegion) return;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.style.cursor = 'wait';
+    if (status) status.textContent = 'loading z3 (~10MB WASM, first load only)…';
+    try {
+      const t0 = performance.now();
+      await loadZ3();
+      const t1 = performance.now();
+      if (status) status.textContent = `z3 loaded in ${Math.round(t1 - t0)}ms — simplifying…`;
+      // Simplify the sub field-by-field.
+      const simplifiedSub = await simplifyComposedSub(payload.composedSub);
+      // Simplify the guard (as a Bool).
+      let simplifiedGuard = payload.composedGuard;
+      if (payload.composedGuard && payload.composedGuard !== 'true') {
+        try {
+          const guardSimp = await simplifyComposedSub({ __guard__: payload.composedGuard });
+          // __guard__ wasn't in Z3_VAR_SORTS so inferZ3ResultSort applied;
+          // for an `(and ...)` it would return Bool. Result expression
+          // string is in __guard__ key.
+          simplifiedGuard = guardSimp.__guard__ || payload.composedGuard;
+        } catch (e) {
+          // best-effort; keep pre-simplify guard if z3 chokes
+          console.warn('guard simplify failed:', e);
+        }
+      }
+      const t2 = performance.now();
+
+      // Replace sub rows.
+      const newRows = Object.entries(simplifiedSub).map(([k, v]) =>
+        `<div class="row"><span class="k">${escapeHtml(k)}</span><span class="v" style="font-size:11px;">${escapeHtml(v)}</span></div>`
+      ).join('');
+      subRegion.innerHTML = newRows;
+      // Replace guard.
+      if (guardRegion) {
+        guardRegion.textContent = simplifiedGuard;
+      }
+      // Update sub label to drop the "JS substitution-only" suffix.
+      if (subLabelRegion) {
+        const fieldCount = Object.keys(simplifiedSub).length;
+        subLabelRegion.textContent =
+          `sub · composed (${fieldCount} field${fieldCount === 1 ? '' : 's'}) — z3-simplified`;
+      }
+
+      btn.style.opacity = '1';
+      btn.style.cursor = 'pointer';
+      btn.disabled = false;
+      btn.textContent = 'Re-simplify';
+      if (status) {
+        status.textContent =
+          `✓ simplified · z3 ${Math.round(t1 - t0)}ms · simplify ${Math.round(t2 - t1)}ms`;
+      }
+    } catch (e) {
+      console.warn('z3 simplify failed:', e);
+      btn.style.opacity = '1';
+      btn.style.cursor = 'pointer';
+      btn.disabled = false;
+      btn.textContent = 'Simplify with Z3';
+      if (status) {
+        status.textContent = '✗ ' + (e && e.message ? e.message : String(e));
+      }
+    }
+  });
+}
+
 function classifyImarkRange(pcs) {
   if (!pcs || pcs.length === 0) {
     return { kind: 'empty', blocks: [], reason: 'no program-counter values in range' };
@@ -3085,10 +3303,11 @@ function renderDetail() {
       : '';
     // Live-composed effect for linear ranges: chain-compose Voogd's
     // compose_subs over the transitions in execution (pc-sorted) order.
-    // Substitution-only — no Z3 simplify yet (next commit). Result is
-    // algebraically correct but visually nested (e.g. (bvadd C1 (bvadd
-    // C2 rsp)) instead of the collapsed (bvadd (C1+C2) rsp)).
+    // Pre-simplify result (substitution-only) is algebraically correct
+    // but visually nested. Z3 simplify button below collapses the
+    // nested expressions when clicked (lazy-loads ~10MB WASM).
     let liveComposedSection = '';
+    let _liveComposedForButton = null;
     if (rangeKind === 'linear' && transitions.length > 0) {
       // Sort transitions by their src position in pcs (chain order).
       const orderedTs = transitions.slice().sort(
@@ -3103,21 +3322,28 @@ function renderDetail() {
         : escapeHtml(lastT.tgt);
       const subBody = composedEntries.length === 0
         ? '<p class="placeholder">empty (no state change)</p>'
-        : `<div class="section-children">${composedEntries.map(([k, v]) =>
+        : `<div class="section-children" data-region="composed-sub">${composedEntries.map(([k, v]) =>
             `<div class="row"><span class="k">${escapeHtml(k)}</span><span class="v" style="font-size:11px;">${escapeHtml(v)}</span></div>`
           ).join('')}</div>`;
       liveComposedSection = `
-        <section class="detail">
-          <h2>Composed relational transformer · ${orderedTs.length}-step chain (live, pre-simplify)</h2>
+        <section class="detail" data-region="live-composed">
+          <h2>Composed relational transformer · ${orderedTs.length}-step chain (live)</h2>
           <div class="row"><span class="k">entry pc</span><span class="v">${escapeHtml(orderedTs[0].src)}</span></div>
           <div class="row"><span class="k">exit pc</span><span class="v">${composedTgt}</span></div>
           <div class="row"><span class="k">fields touched</span><span class="v">${composedEntries.length}</span></div>
-          ${composedGuard !== 'true' ? `<div class="section-label">guard / path-condition (composed)</div><pre>${escapeHtml(composedGuard)}</pre>` : `<div class="section-label">guard / path-condition (composed)</div><p class="placeholder">true (no path-condition along chain)</p>`}
-          <div class="section-label">sub · composed (${composedEntries.length} field${composedEntries.length === 1 ? '' : 's'}) — Voogd compose_subs, JS substitution-only</div>
+          ${composedGuard !== 'true' ? `<div class="section-label" data-region="composed-guard-label">guard / path-condition (composed)</div><pre data-region="composed-guard">${escapeHtml(composedGuard)}</pre>` : `<div class="section-label">guard / path-condition (composed)</div><p class="placeholder">true (no path-condition along chain)</p>`}
+          <div class="section-label" data-region="composed-sub-label">sub · composed (${composedEntries.length} field${composedEntries.length === 1 ? '' : 's'}) — Voogd compose_subs, JS substitution-only</div>
           ${subBody}
-          <p class="placeholder" style="font-size:11px;">Z3 simplify (next commit) will collapse nested (bvadd C1 (bvadd C2 x)) → (bvadd (C1+C2) x) and similar.</p>
+          <div class="z3-simplify-controls" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="z3-simplify-btn" data-action="z3-simplify" style="font-family:inherit;font-size:11px;padding:4px 10px;background:var(--code-bg);color:var(--accent);border:1px solid var(--accent);border-radius:3px;cursor:pointer;">Simplify with Z3</button>
+            <span class="z3-simplify-status" style="font-size:10px;color:var(--fg-muted);"></span>
+          </div>
+          <p class="placeholder" style="font-size:11px;">Pre-simplify shows nested (bvadd C1 (bvadd C2 x)) instead of the collapsed (bvadd (C1+C2) x). Click "Simplify with Z3" to lazy-load z3 (~10MB WASM, browser-cached after first load) and replace expressions with their z3-simplified forms.</p>
         </section>
       `;
+      // Capture the composed sub + guard so the button handler
+      // can simplify them async after the DOM is in place.
+      _liveComposedForButton = { composedSub: composed, composedGuard };
     }
     // Sophie's followup ordering rule: ASM listing → Source listing
     // → Relational transformer (here = live-composed for linear
@@ -3148,6 +3374,11 @@ function renderDetail() {
     wireSourceWindowClicks(el);
     wireAsmListingClicks(el);
     wireTransitionIndexClicks(el);
+    // Wire the Z3 simplify button if the live-composed section
+    // rendered (rangeKind === 'linear' && transitions.length > 0).
+    if (_liveComposedForButton) {
+      wireZ3SimplifyButton(el, _liveComposedForButton);
+    }
   } else {
     // Future variants land here until their respective commits
     // implement dedicated renderers. After c4/c3 ship, only idea C
@@ -4019,6 +4250,10 @@ init().then(() => {
     composeSubs,
     composeChain,
     composeChainGuard,
+    // Z3 simplify (lazy-loaded; works on github-pages-served origin
+    // where coi-serviceworker enables SharedArrayBuffer).
+    loadZ3,
+    simplifyComposedSub,
   };
 });
 </script>
