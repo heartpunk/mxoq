@@ -1630,12 +1630,33 @@ function installLabelOverlay(cy, overlayEl, { compact }) {
 
 function syncEdgeLabels(cy, overlayEl, { compact }) {
   if (!cy || !overlayEl) return;
-  const z = cy.zoom();
-  const p = cy.pan();
+  // Guard: cy may have been destroyed by a rebuildScopedImarkGraph
+  // between the rAF schedule and this run. Calling cy.zoom() / pan()
+  // / edges()[i].midpoint() on a destroyed cy throws null-deref
+  // inside cytoscape's renderer. Wrap in try/catch so a stale rAF
+  // doesn't surface the error to the user.
+  let z, p;
+  try {
+    z = cy.zoom();
+    p = cy.pan();
+  } catch (e) {
+    return;
+  }
   // Track which edges still exist so orphan divs can be removed.
   const live = new Set();
-  cy.edges().forEach(e => {
-    const text = e.data('label');
+  let edgeList;
+  try {
+    edgeList = cy.edges();
+  } catch (e) {
+    return;
+  }
+  edgeList.forEach(e => {
+    let text;
+    try {
+      text = e.data('label');
+    } catch (err) {
+      return; // edge gone; skip
+    }
     if (!text) return;
     const id = e.id();
     live.add(id);
@@ -1680,8 +1701,14 @@ function syncEdgeLabels(cy, overlayEl, { compact }) {
     div.classList.toggle('in-scope', e.hasClass('in-scope'));
     div.classList.toggle('out-of-scope', e.hasClass('out-of-scope'));
     // Anchor at edge midpoint in screen coords. cytoscape's midpoint()
-    // returns model-space; convert via current zoom + pan.
-    const m = e.midpoint();
+    // returns model-space; convert via current zoom + pan. Guard:
+    // a stale edge in a destroyed cy can throw inside getEdgeMidpoint.
+    let m;
+    try {
+      m = e.midpoint();
+    } catch (err) {
+      return;
+    }
     const x = m.x * z + p.x;
     const y = m.y * z + p.y;
     // Reset offset (collision pass will add nudges via dx/dy data attrs).
@@ -2443,20 +2470,32 @@ let _z3CachePromise = null;
 async function loadZ3() {
   if (_z3CachePromise) return _z3CachePromise;
   _z3CachePromise = (async () => {
-    // Step 1: classic script from jsdelivr's direct file path. Sets
-    // globalThis.initZ3 as a side effect. Loaded as a regular
-    // <script> tag (not ESM) so emscripten's module bootstrap works.
+    // Step 1: classic script for the emscripten module. MUST be served
+    // from the SAME origin as the page — z3-solver spawns Web Workers
+    // from the script's URL, and same-origin policy blocks cross-
+    // origin worker spawning (would error: 'Failed to construct
+    // Worker: Script at ... cannot be accessed from origin ...').
+    // We self-host z3-built.js + z3-built.wasm + z3-built.worker.js
+    // alongside imark.html under ./z3/. On the github-pages deploy
+    // (heartpunk.github.io/mxoq/) this resolves to the same-origin
+    // path; everywhere else (gisthost, etc.) the files won't be there
+    // and the script load will 404 — z3 simplify just stays disabled.
     if (typeof globalThis.initZ3 !== 'function') {
       await new Promise((res, rej) => {
         const s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/z3-solver@latest/build/z3-built.js';
+        s.src = 'z3/z3-built.js';
         s.onload = () => res();
-        s.onerror = () => rej(new Error('failed to load z3-built.js from jsdelivr'));
+        s.onerror = () => rej(new Error(
+          'failed to load z3/z3-built.js (only available on github-pages-served origin where ./z3/ is in scope)'
+        ));
         document.head.appendChild(s);
       });
     }
-    // Step 2: import the high-level wrapper from esm.sh. The wrapper
-    // looks up globalThis.initZ3 and bootstraps the Z3 context.
+    // Step 2: import the high-level wrapper. esm.sh handles z3-solver's
+    // dep tree (async-mutex + WASM worker structure) better than
+    // jsdelivr's +esm rewriter; the wrapper itself is just JS and
+    // can come from CDN, only the WASM module + worker must be
+    // same-origin (handled above).
     const mod = await import('https://esm.sh/z3-solver/build/browser');
     const z3p = await mod.init();
     return z3p;
@@ -2519,6 +2558,58 @@ function inferZ3ResultSort(exprText) {
   return '(_ BitVec 64)';
 }
 
+// SMT-LIB definitions for pyvex's little-endian mem helpers. Pyvex
+// emits (store_le_N m a v) and (select_le_N m a) which aren't in
+// standard SMT-LIB; we expand them into byte-level (store ...)
+// and (concat (select m a+i) ...) chains so z3 can simplify them.
+//
+// Using define-fun (z3-supported) keeps the prefix terse — z3 inlines
+// each call site at parse time, so simplify sees the underlying
+// byte-level form. Expansion is little-endian per the pyvex contract.
+const Z3_PYVEX_HELPER_DEFS = `
+(define-fun store_le_1 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64)) (v (_ BitVec 8)))
+                       (Array (_ BitVec 64) (_ BitVec 8))
+  (store m a v))
+(define-fun store_le_2 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64)) (v (_ BitVec 16)))
+                       (Array (_ BitVec 64) (_ BitVec 8))
+  (store (store m a ((_ extract 7 0) v))
+         (bvadd a #x0000000000000001) ((_ extract 15 8) v)))
+(define-fun store_le_4 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64)) (v (_ BitVec 32)))
+                       (Array (_ BitVec 64) (_ BitVec 8))
+  (store (store (store (store m a ((_ extract 7 0) v))
+                       (bvadd a #x0000000000000001) ((_ extract 15 8) v))
+                (bvadd a #x0000000000000002) ((_ extract 23 16) v))
+         (bvadd a #x0000000000000003) ((_ extract 31 24) v)))
+(define-fun store_le_8 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64)) (v (_ BitVec 64)))
+                       (Array (_ BitVec 64) (_ BitVec 8))
+  (store (store (store (store (store (store (store (store m a ((_ extract 7 0) v))
+                                              (bvadd a #x0000000000000001) ((_ extract 15 8) v))
+                                       (bvadd a #x0000000000000002) ((_ extract 23 16) v))
+                                (bvadd a #x0000000000000003) ((_ extract 31 24) v))
+                         (bvadd a #x0000000000000004) ((_ extract 39 32) v))
+                  (bvadd a #x0000000000000005) ((_ extract 47 40) v))
+           (bvadd a #x0000000000000006) ((_ extract 55 48) v))
+         (bvadd a #x0000000000000007) ((_ extract 63 56) v)))
+(define-fun select_le_1 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64))) (_ BitVec 8)
+  (select m a))
+(define-fun select_le_2 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64))) (_ BitVec 16)
+  (concat (select m (bvadd a #x0000000000000001)) (select m a)))
+(define-fun select_le_4 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64))) (_ BitVec 32)
+  (concat (select m (bvadd a #x0000000000000003))
+          (select m (bvadd a #x0000000000000002))
+          (select m (bvadd a #x0000000000000001))
+          (select m a)))
+(define-fun select_le_8 ((m (Array (_ BitVec 64) (_ BitVec 8))) (a (_ BitVec 64))) (_ BitVec 64)
+  (concat (select m (bvadd a #x0000000000000007))
+          (select m (bvadd a #x0000000000000006))
+          (select m (bvadd a #x0000000000000005))
+          (select m (bvadd a #x0000000000000004))
+          (select m (bvadd a #x0000000000000003))
+          (select m (bvadd a #x0000000000000002))
+          (select m (bvadd a #x0000000000000001))
+          (select m a)))
+`;
+
 // Simplify each value in a composed-sub via z3.
 // Returns { var: simplified-expression-string }.
 async function simplifyComposedSub(composedSub) {
@@ -2526,9 +2617,10 @@ async function simplifyComposedSub(composedSub) {
   const { Context } = z3p;
   // Fresh per-call context so repeated calls don't leak decls/assertions.
   const ctx = Context('mxoq_simp_' + Date.now());
-  const declsPrefix = Object.entries(Z3_VAR_SORTS)
+  const varDecls = Object.entries(Z3_VAR_SORTS)
     .map(([n, s]) => `(declare-fun ${n} () ${s})`)
     .join('\n');
+  const declsPrefix = `${Z3_PYVEX_HELPER_DEFS}\n${varDecls}`;
   const out = {};
   for (const v of Object.keys(composedSub)) {
     const exprText = composedSub[v];
