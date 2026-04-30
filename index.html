@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Extracting instruction-level semantics as labelled transition systems</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.1/dist/purify.min.js"></script>
+  <!-- Pre-rendered SVG + lightweight pan/zoom replaces d3-graphviz +
+       @hpcc-js/wasm. The graph is laid out once at extraction time
+       (`dot -Tsvg` in the regen script); the browser just displays it. -->
+  <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github.min.css"
+        media="(prefers-color-scheme: light)">
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css"
+        media="(prefers-color-scheme: dark)">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      color: #24292f;
+      background: #f6f8fa;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 32px 24px 64px;
+    }
+    body.viewer-only main {
+      max-width: 100vw;
+      padding: 0;
+    }
+    body.viewer-only #doc,
+    body.viewer-only #page-header,
+    body.viewer-only #source-section { display: none; }
+    body.viewer-only .viewer-wrap {
+      border: none;
+      border-radius: 0;
+      padding: 12px 16px;
+      background: white;
+    }
+    body.viewer-only .viewer-frame {
+      height: calc(100vh - 80px);
+    }
+
+    #page-header {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 16px 24px 0;
+      display: flex;
+      justify-content: flex-end;
+    }
+    #page-header a {
+      color: #57606a;
+      text-decoration: none;
+      font-size: 13px;
+      padding: 4px 10px;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      background: white;
+    }
+    #page-header a:hover {
+      background: #e6eaef;
+      color: #24292f;
+    }
+
+    #source-section {
+      background: white;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+      padding: 24px 28px 28px;
+      margin-top: 32px;
+    }
+    #source-section h2 {
+      margin: 0 0 8px;
+      font-size: 22px;
+    }
+    #source-section .blurb {
+      margin: 0 0 16px;
+      color: #57606a;
+      font-size: 14px;
+    }
+    #source-section details {
+      margin-bottom: 8px;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    #source-section details summary {
+      cursor: pointer;
+      padding: 10px 14px;
+      background: #f6f8fa;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    #source-section details summary .file-name { font-weight: 600; }
+    #source-section details summary .file-meta {
+      color: #57606a;
+      font-weight: normal;
+      font-size: 12px;
+    }
+    #source-section details summary .raw-link {
+      margin-left: auto;
+      font-size: 11px;
+      color: #0969da;
+      text-decoration: none;
+    }
+    #source-section details summary .raw-link:hover {
+      text-decoration: underline;
+    }
+    #source-section details[open] summary {
+      border-bottom: 1px solid #d0d7de;
+    }
+    #source-section pre {
+      margin: 0;
+      padding: 16px;
+      background: white;
+      overflow-x: auto;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+      line-height: 1.5;
+    }
+    #source-section pre code.hljs {
+      padding: 0;
+      background: white;
+    }
+    .src-loading { color: #57606a; padding: 16px; font-style: italic; }
+    .src-error {
+      background: #fff8c5;
+      padding: 12px;
+      border-radius: 4px;
+      margin: 12px;
+      color: #693e00;
+    }
+    .doc {
+      background: white;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+      padding: 32px 40px;
+      margin-bottom: 32px;
+    }
+    .doc h1 { border-bottom: 1px solid #d0d7de; padding-bottom: 8px; }
+    .doc h1, .doc h2, .doc h3, .doc h4 { margin-top: 24px; }
+    .doc blockquote {
+      border-left: 3px solid #d0d7de;
+      padding: 8px 16px;
+      margin: 12px 0;
+      color: #57606a;
+      background: #f6f8fa;
+    }
+    .doc code {
+      background: #eaeef2;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 90%;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    }
+    .doc pre {
+      background: #f6f8fa;
+      padding: 16px;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+    }
+    .doc pre code { background: none; padding: 0; }
+    .doc a { color: #0969da; }
+    .doc hr { border: none; border-top: 1px solid #d0d7de; margin: 32px 0; }
+    .doc table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+    .doc table th, .doc table td {
+      border: 1px solid #d0d7de;
+      padding: 6px 12px;
+      text-align: left;
+    }
+    .doc table th { background: #f6f8fa; }
+
+    .viewer-wrap {
+      background: white;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+      padding: 24px 28px 28px;
+    }
+    .viewer-wrap h2 { margin: 0 0 8px; font-size: 22px; }
+    .viewer-wrap .blurb { margin: 0 0 16px; color: #57606a; font-size: 14px; }
+    .viewer-controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      align-items: center;
+    }
+    .viewer-controls button,
+    .viewer-controls a {
+      background: #f6f8fa;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 13px;
+      color: #24292f;
+      text-decoration: none;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .viewer-controls button:hover,
+    .viewer-controls a:hover { background: #e6eaef; }
+    .viewer-controls .status {
+      font-size: 12px;
+      color: #57606a;
+      margin-left: 8px;
+    }
+    .viewer-frame {
+      width: 100%;
+      height: 80vh;
+      min-height: 600px;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      background: white;
+      overflow: hidden;
+      position: relative;
+    }
+    .viewer-frame:fullscreen {
+      background: white;
+      padding: 16px;
+      height: 100vh;
+      width: 100vw;
+    }
+    .viewer-frame svg {
+      width: 100% !important;
+      height: 100% !important;
+    }
+    .loading {
+      padding: 48px;
+      text-align: center;
+      color: #57606a;
+    }
+    .error {
+      background: #fff8c5;
+      padding: 16px;
+      border-radius: 6px;
+      border: 1px solid #d4a72c;
+      color: #693e00;
+      margin: 16px 0;
+    }
+
+    /* Dark mode — follow OS / browser preference automatically. */
+    @media (prefers-color-scheme: dark) {
+      body { color: #c9d1d9; background: #0d1117; }
+      .doc, .viewer-wrap, #source-section {
+        background: #161b22; border-color: #30363d;
+      }
+      .doc h1, .doc h2, .doc h3, .doc h4 { color: #c9d1d9; }
+      .doc h1 { border-bottom-color: #30363d; }
+      .doc blockquote {
+        background: #161b22; border-left-color: #30363d; color: #8b949e;
+      }
+      .doc code { background: #2d333b; color: #c9d1d9; }
+      .doc pre { background: #161b22; }
+      .doc a { color: #58a6ff; }
+      .doc hr { border-top-color: #30363d; }
+      .doc table th, .doc table td { border-color: #30363d; }
+      .doc table th { background: #161b22; }
+      #page-header a {
+        color: #8b949e; background: #161b22; border-color: #30363d;
+      }
+      #page-header a:hover { background: #21262d; color: #c9d1d9; }
+      #source-section details { border-color: #30363d; }
+      #source-section details summary { background: #161b22; }
+      #source-section details summary .file-meta { color: #8b949e; }
+      #source-section details summary .raw-link { color: #58a6ff; }
+      #source-section details[open] summary { border-bottom-color: #30363d; }
+      #source-section pre { background: #161b22; }
+      #source-section pre code.hljs { background: #161b22; }
+      .viewer-controls button, .viewer-controls a {
+        background: #161b22; color: #c9d1d9; border-color: #30363d;
+      }
+      .viewer-controls button:hover, .viewer-controls a:hover {
+        background: #21262d;
+      }
+      .viewer-frame { background: #161b22; border-color: #30363d; }
+      .viewer-frame:fullscreen { background: #161b22; }
+      .src-loading { color: #8b949e; }
+      /* The graph viewer swaps to tsm_utf8_mach_feed.dark.svg via JS
+         (see prefers-color-scheme handler below); no CSS color
+         override needed for the SVG itself. */
+    }
+  </style>
+</head>
+<body>
+  <header id="page-header">
+    <a id="gist-link"
+       href="https://gist.github.com/heartpunk/ddbae59d842784f30eaa1f0202531657"
+       target="_blank" rel="noopener">View on GitHub</a>
+  </header>
+  <main id="main">
+    <div class="doc" id="doc">
+      <div class="loading">loading…</div>
+    </div>
+
+    <section class="viewer-wrap">
+      <h2>Interactive graph: <code>tsm_utf8_mach_feed</code></h2>
+      <p class="blurb">
+        Pan and zoom the full CFG of <code>tsm_utf8_mach_feed</code>
+        below. Each edge label carries the simplified guard / sub
+        SMT formulas + edge-local CSE defs (the <code>L_K := …</code>
+        rows). Drag to pan; scroll to zoom; double-click to fit-to-view.
+      </p>
+      <div class="viewer-controls">
+        <button id="fullscreen-tsm">⛶ fullscreen</button>
+        <a id="popout-tsm" target="_blank" rel="noopener">↗ open in new tab</a>
+        <a id="back-to-article" style="display: none;">← back to article</a>
+        <span class="status" id="viewer-status-tsm">loading viewer…</span>
+      </div>
+      <div id="viewer-tsm" class="viewer-frame"></div>
+    </section>
+
+    <section class="viewer-wrap">
+      <h2>Interactive graph: <code>SHA1Update</code></h2>
+      <p class="blurb">
+        Pan and zoom the full CFG of <code>SHA1Update</code> from
+        libmd. Three functions in the family — <code>SHA1Update</code>
+        (root), <code>memcpy</code> (primitive summary, single
+        transition with the X2 <code>(mem_after_memcpy …)</code> shape),
+        and <code>SHA1Transform</code> (sibling extracted normally).
+        Same controls: drag to pan; scroll to zoom; double-click
+        to fit-to-view.
+      </p>
+      <div class="viewer-controls">
+        <button id="fullscreen-sha1">⛶ fullscreen</button>
+        <a id="popout-sha1" target="_blank" rel="noopener">↗ open in new tab</a>
+        <span class="status" id="viewer-status-sha1">loading viewer…</span>
+      </div>
+      <div id="viewer-sha1" class="viewer-frame"></div>
+    </section>
+
+    <section class="viewer-wrap">
+      <h2>Interactive graph: <code>luaV_execute</code></h2>
+      <p class="blurb">
+        Pan and zoom the bytecode-interpreter dispatch loop of
+        Lua 5.1 (<code>luaV_execute</code> from
+        <code>lvm.c</code>). Family extracted: 41 functions,
+        375 blocks in <code>luaV_execute</code> alone, 771
+        transitions total — the dispatch hub plus opcode arms,
+        with libc + lua-internal helpers summarized as primitive
+        transitions (32 of them, the <code>kind=primitive</code>
+        nodes). Same controls: drag to pan; scroll to zoom;
+        double-click to fit-to-view.
+      </p>
+      <div class="viewer-controls">
+        <button id="fullscreen-lua">⛶ fullscreen</button>
+        <a id="popout-lua" target="_blank" rel="noopener">↗ open in new tab</a>
+        <span class="status" id="viewer-status-lua">loading viewer…</span>
+      </div>
+      <div id="viewer-lua" class="viewer-frame"></div>
+    </section>
+
+    <section id="source-section">
+      <h2>Source code</h2>
+      <p class="blurb">
+        The seven Python files that make up the small-core extractor +
+        runnable demo. Click any header to expand. Each <code>raw</code>
+        link goes to the file's gist raw URL.
+      </p>
+      <details data-src="transition.py">
+        <summary>
+          <span class="file-name">transition.py</span>
+          <span class="file-meta">Transition dataclass + mnemonic helpers</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="smt_emit.py">
+        <summary>
+          <span class="file-name">smt_emit.py</span>
+          <span class="file-meta">claripy → SMT-LIB serializer</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="target_manifest.py">
+        <summary>
+          <span class="file-name">target_manifest.py</span>
+          <span class="file-meta">extraction-target metadata</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="x86_flags.py">
+        <summary>
+          <span class="file-name">x86_flags.py</span>
+          <span class="file-meta">eflags bit positions + cc_op COPY seeding</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="dataflow.py">
+        <summary>
+          <span class="file-name">dataflow.py</span>
+          <span class="file-meta">register / memory I/O tracking helpers</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="angr_backend.py">
+        <summary>
+          <span class="file-name">angr_backend.py</span>
+          <span class="file-meta">core IMark-granular translator</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="demo.py">
+        <summary>
+          <span class="file-name">demo.py</span>
+          <span class="file-meta">PEP 723 single-block CLI demo</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+      <details data-src="executor.py">
+        <summary>
+          <span class="file-name">executor.py</span>
+          <span class="file-meta">concrete LTS executor (z3-based) · cross-checks against the native binary</span>
+          <a class="raw-link" target="_blank" rel="noopener">raw</a>
+        </summary>
+        <pre><code class="language-python hljs">loading…</code></pre>
+      </details>
+    </section>
+  </main>
+
+  <script>
+    // Discover the gist ID from `?<gist-id>` (gistpreview/gisthost
+    // pattern). Falls back to relative paths for local dev.
+    const rawSearch = window.location.search.replace(/^\?/, '');
+    const segments = rawSearch.split('&');
+    const firstSeg = (segments[0] || '').split('=')[0];
+    const GIST_ID = /^[a-f0-9]+$/i.test(firstSeg) ? firstSeg : null;
+    const VIEWER_ONLY = segments.includes('viewer-only=1');
+
+    function rawUrl(filename) {
+      if (GIST_ID) {
+        return `https://gist.githubusercontent.com/raw/${GIST_ID}/raw/${filename}`;
+      }
+      return filename;
+    }
+
+    // Cache-buster appended to gist-raw URLs so a fresh push of the
+    // SVG / sources isn't masked by Fastly's edge cache (we hit a
+    // multi-POP split-cache during gist iteration where some POPs
+    // returned the old artifact and others the new). Stable for one
+    // page load; reload to fetch any newly pushed artifact.
+    const CACHE_BUSTER = `?v=${Date.now()}`;
+    function rawUrlBust(filename) {
+      const base = rawUrl(filename);
+      // Only attach to absolute gist URLs; local-dev fallback paths
+      // shouldn't grow query strings (file:// servers may not parse
+      // them, and there's no CDN involved either way).
+      return GIST_ID ? base + CACHE_BUSTER : base;
+    }
+
+    if (VIEWER_ONLY) {
+      // Mode class on <body> so it can hide both descendants of
+      // <main> AND the sibling <header id="page-header">.
+      document.body.classList.add("viewer-only");
+      // In viewer-only mode, swap the tsm viewer's "open in new tab"
+      // affordance for "back to article" so the reader has
+      // orientation. Both viewers stay visible (viewer-only mode
+      // doesn't yet target a specific one); only tsm gets the
+      // back-link since it's the primary walkthrough.
+      const popoutTsm = document.getElementById("popout-tsm");
+      const backLink = document.getElementById("back-to-article");
+      if (popoutTsm) popoutTsm.style.display = "none";
+      if (backLink) {
+        backLink.style.display = "";
+        backLink.href = window.location.pathname
+          + (GIST_ID ? `?${GIST_ID}` : "");
+      }
+    }
+
+    // ---- Markdown render ----
+    const docEl = document.getElementById("doc");
+    if (!VIEWER_ONLY) {
+      fetch(rawUrlBust("README.md"))
+        .then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.text();
+        })
+        .then(md => {
+          // DOMPurify is loaded synchronously in <head>; defensive sanitize
+          // even though README content is trusted-author. Default config
+          // allows the common safe HTML tags markdown emits (a, p, h1-6,
+          // table/th/td, code, pre, blockquote, ul/ol/li, em, strong, hr,
+          // br) and strips <script>, on* handlers, javascript: URLs, and
+          // other XSS-shaped constructs.
+          docEl.innerHTML = DOMPurify.sanitize(marked.parse(md));
+        })
+        .catch(err => {
+          docEl.innerHTML =
+            `<div class="error">failed to load README.md: ${err.message}<br>`
+            + `tried URL: ${rawUrl("README.md")}</div>`;
+        });
+    }
+
+    // ---- SVG viewer factory: theme-aware swap + pan/zoom ----
+    //
+    // Two viewers exist on the page (tsm + sha1), each with its own
+    // light/dark SVG pair. We factor the common logic into a
+    // makeViewer(opts) function and call it once per target.
+    //
+    // Each target's pair:
+    //   tsm_utf8_mach_feed.svg / .dark.svg  — UTF-8 decoder walkthrough
+    //   SHA1Update.svg / .dark.svg          — sha1_update + memcpy primitive
+    //
+    // We pick a palette per viewer based on `prefers-color-scheme` at
+    // load time, fetch the SVG markup, inject inline (so svg-pan-zoom
+    // can hook it), and re-fetch+rebind when the OS theme flips while
+    // the page is open.
+    //
+    // Inline (vs <img src=...>) is required because svg-pan-zoom mutates
+    // the SVG's viewBox / transform on each user interaction; <img>
+    // wouldn't expose that.
+    const darkMq = window.matchMedia("(prefers-color-scheme: dark)");
+
+    function makeViewer(opts) {
+      const viewerEl = document.getElementById(opts.viewerId);
+      const status = document.getElementById(opts.statusId);
+      const popout = document.getElementById(opts.popoutId);
+      const fsBtn = document.getElementById(opts.fullscreenId);
+      let panZoomInst = null;
+
+      function showError(msg) {
+        status.style.display = "none";
+        viewerEl.innerHTML = `<div class="error">${msg}</div>`;
+      }
+
+      function svgFilenameFor(isDark) {
+        return isDark ? opts.darkSvg : opts.lightSvg;
+      }
+
+      function loadGraphForTheme(isDark) {
+        // Tear down any previous pan/zoom instance so we don't leak
+        // event listeners or transform state across theme swaps.
+        if (panZoomInst) {
+          try { panZoomInst.destroy(); } catch (_) { /* best-effort */ }
+          panZoomInst = null;
+        }
+        status.style.display = "";
+        status.textContent = "loading viewer…";
+        const filename = svgFilenameFor(isDark);
+        fetch(rawUrlBust(filename))
+          .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.text();
+          })
+          .then(svgText => {
+            // Strip the XML/DOCTYPE preamble so the SVG can be
+            // inserted into an HTML document directly. Browsers
+            // tolerate the preamble in most cases, but mixing XML
+            // processing instructions into HTML is non-standard.
+            const svgStart = svgText.indexOf("<svg");
+            const cleaned = svgStart >= 0 ? svgText.slice(svgStart) : svgText;
+            viewerEl.innerHTML = cleaned;
+            // Make the SVG fill the viewer frame regardless of its
+            // intrinsic width/height attributes (graphviz emits
+            // absolute points). The CSS `.viewer-frame svg
+            // { width:100% }` rule also enforces this; setting
+            // attributes here keeps svg-pan-zoom's sizing math happy.
+            const svgEl = viewerEl.querySelector("svg");
+            if (!svgEl) {
+              showError("no <svg> root found in fetched markup");
+              return;
+            }
+            svgEl.setAttribute("width", "100%");
+            svgEl.setAttribute("height", "100%");
+            // Initialize pan/zoom. fit + center makes the whole
+            // graph visible on first paint; user can scroll/drag.
+            if (typeof svgPanZoom === "function") {
+              panZoomInst = svgPanZoom(svgEl, {
+                zoomEnabled: true,
+                controlIconsEnabled: false,
+                fit: true,
+                center: true,
+                minZoom: 0.05,
+                maxZoom: 50,
+                zoomScaleSensitivity: 0.4,
+              });
+            }
+            status.textContent = "ready";
+            setTimeout(() => { status.style.display = "none"; }, 1500);
+          })
+          .catch(err => {
+            showError(`failed to load ${filename}: ${err.message}`);
+          });
+      }
+
+      loadGraphForTheme(darkMq.matches);
+
+      // Re-fetch the matching SVG on OS theme change. addEventListener
+      // is the modern API; older Safari needs addListener — guard both.
+      const onThemeChange = (e) => loadGraphForTheme(e.matches);
+      if (darkMq.addEventListener) {
+        darkMq.addEventListener("change", onThemeChange);
+      } else if (darkMq.addListener) {
+        darkMq.addListener(onThemeChange);
+      }
+
+      // ---- Per-viewer fullscreen + new-tab controls ----
+      // Popout opens the raw light-theme SVG in a new tab; for the
+      // tsm viewer we keep the existing viewer-only=1 mode (which
+      // hides everything except .viewer-wrap, showing both viewers
+      // again — fine for now). For sha1 we link straight to the SVG
+      // since viewer-only mode doesn't yet target a specific viewer.
+      if (popout) {
+        popout.href = opts.popoutHref;
+      }
+      if (fsBtn) {
+        fsBtn.addEventListener("click", () => {
+          const el = document.getElementById(opts.viewerId);
+          if (!document.fullscreenElement) {
+            if (el.requestFullscreen) {
+              el.requestFullscreen().catch(err => {
+                console.error("fullscreen failed:", err);
+              });
+            } else if (el.webkitRequestFullscreen) {
+              el.webkitRequestFullscreen();
+            }
+          } else {
+            document.exitFullscreen?.();
+          }
+        });
+      }
+    }
+
+    // Construct the two viewers.
+    const tsmPopoutHref = window.location.pathname + (
+      GIST_ID ? `?${GIST_ID}&viewer-only=1` : "?viewer-only=1"
+    );
+    makeViewer({
+      viewerId: "viewer-tsm",
+      statusId: "viewer-status-tsm",
+      popoutId: "popout-tsm",
+      fullscreenId: "fullscreen-tsm",
+      lightSvg: "tsm_utf8_mach_feed.svg",
+      darkSvg: "tsm_utf8_mach_feed.dark.svg",
+      popoutHref: tsmPopoutHref,
+    });
+    makeViewer({
+      viewerId: "viewer-sha1",
+      statusId: "viewer-status-sha1",
+      popoutId: "popout-sha1",
+      fullscreenId: "fullscreen-sha1",
+      lightSvg: "SHA1Update.svg",
+      darkSvg: "SHA1Update.dark.svg",
+      popoutHref: rawUrl("SHA1Update.svg"),  // direct SVG link for now
+    });
+    makeViewer({
+      viewerId: "viewer-lua",
+      statusId: "viewer-status-lua",
+      popoutId: "popout-lua",
+      fullscreenId: "fullscreen-lua",
+      lightSvg: "luaV_execute.svg",
+      darkSvg: "luaV_execute.dark.svg",
+      popoutHref: rawUrl("luaV_execute.svg"),
+    });
+
+    // ---- Source code listings ----
+    // For each <details data-src="…"> in #source-section, fetch the
+    // corresponding raw file and inject as TEXT (not HTML — this is
+    // user-facing source, never trust it as markup) into the <code>
+    // element. Then call hljs.highlightElement so the GitHub theme
+    // applies. We highlight per-file as it loads so the page is
+    // progressive instead of waiting on the slowest fetch.
+    if (!VIEWER_ONLY) {
+      const detailsList = document.querySelectorAll(
+        "#source-section details[data-src]"
+      );
+      detailsList.forEach(det => {
+        const filename = det.dataset.src;
+        // `url` is the canonical, user-facing raw URL (used as the
+        // href on the visible `raw` link). The fetch below uses the
+        // cache-busted variant so a freshly pushed source file
+        // shows up without waiting on Fastly's edge cache.
+        const url = rawUrl(filename);
+        const fetchUrl = rawUrlBust(filename);
+        const codeEl = det.querySelector("code");
+        const rawLink = det.querySelector(".raw-link");
+        rawLink.href = url;
+        // The raw link sits inside <summary>, which is itself the
+        // disclosure control. Without stopPropagation, clicking the
+        // link both opens the new tab AND toggles the <details>.
+        // Stop propagation so the link behaves like a plain anchor.
+        rawLink.addEventListener("click", ev => ev.stopPropagation());
+
+        fetch(fetchUrl)
+          .then(r => {
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.text();
+          })
+          .then(text => {
+            // Replace placeholder with raw source. textContent is the
+            // safe sink: any closing script tag or "<img onerror=…>"
+            // in the file becomes literal characters, not parsed
+            // markup. (Avoid writing the literal closing-script tag
+            // here in any form — even inside this comment — because
+            // the HTML parser scans for it and would terminate the
+            // outer <script> block prematurely.)
+            codeEl.textContent = text;
+            // Update file-meta with line count for a small sanity cue.
+            const meta = det.querySelector(".file-meta");
+            const lines = text.split("\n").length;
+            const existing = meta.textContent;
+            meta.textContent = `${existing} · ${lines} lines`;
+            if (typeof hljs !== "undefined") {
+              hljs.highlightElement(codeEl);
+            }
+          })
+          .catch(err => {
+            codeEl.textContent =
+              `# failed to load ${filename}: ${err.message}\n`
+              + `# tried URL: ${url}\n`;
+          });
+      });
+    }
+  </script>
+</body>
+</html>

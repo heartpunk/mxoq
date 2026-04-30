@@ -1,0 +1,4026 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>tsm_utf8_mach_feed — instruction + block view (v0)</title>
+<!-- Suppress the auto-favicon 404. Browsers GET /favicon.ico by
+     default; for this gist-served debugging viewer there's no
+     icon to ship and the 404 spammed every page load. The
+     data:, value (empty data URI) tells the browser the icon
+     is intentionally empty. -->
+<link rel="icon" href="data:," />
+<!-- coi-serviceworker injects Cross-Origin-Opener-Policy:same-origin
+     and Cross-Origin-Embedder-Policy:require-corp into responses on
+     this origin. Required for SharedArrayBuffer (which z3-solver's
+     WASM threading needs). On the github-pages-served deploy at
+     heartpunk.github.io/mxoq/ this enables in-browser z3 simplify;
+     on other origins (gisthost, etc.) the SW scopes don't apply. -->
+<script src="coi-serviceworker.min.js"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #161616;
+  --fg: #e8e8e8;
+  --fg-muted: #888;
+  --fg-faint: #555;
+  --accent: #d09050;
+  --accent-faint: #5a3a18;
+  --selected: #f0a050;
+  --selected-text: #161616;
+  --pane-bg: #1c1c1c;
+  --panel-bg: #1f1f1f;
+  --panel-border: #2c2c2c;
+  --code-bg: #0d0d0d;
+  --node-fill: #2a2a2a;
+  --node-fill-selected: #f0a050;
+  --node-fill-related: #6a4a20;
+  --node-stroke: #555;
+  --node-stroke-selected: #ffd080;
+  --edge: #4a4a4a;
+  --edge-active: #d09050;
+  --rule: #2c2c2c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+}
+header.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+  background: var(--bg);
+}
+.title { font-weight: 600; }
+.title .v { color: var(--fg-muted); font-weight: 400; margin-left: 6px; }
+.mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--node-stroke);
+  border-radius: 3px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.mode-toggle button {
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--fg-muted);
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+.mode-toggle button.active {
+  background: var(--accent);
+  color: var(--selected-text);
+  font-weight: 500;
+}
+.helper-text {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+main {
+  /* Both inter-pane boundaries are CSS variables for drag-resize.
+     --left-width starts at 1fr (equal-share with the right pane);
+     when the user drags the left↔right divider, JS sets it to an
+     explicit pixel value, after which the right pane (still 1fr)
+     fills the remaining space.
+     --detail-width starts at 360px and stretches/shrinks via the
+     right divider on #detail-panel. */
+  --left-width: 1fr;
+  --detail-width: 360px;
+  display: grid;
+  grid-template-columns: var(--left-width) 1fr var(--detail-width);
+  grid-template-rows: 1fr;
+  grid-template-areas: "left right detail";
+  height: calc(100vh - 70px - 30px);
+}
+body.mode-full-imark main {
+  /* Full-imark mode: primary spans columns 1+2; left↔right divider
+     is hidden in this mode (only detail divider applies). */
+  grid-template-columns: 1fr var(--detail-width);
+  grid-template-areas: "primary detail";
+}
+#left-pane   { grid-area: left; }
+#right-pane  { grid-area: right; }
+#full-pane   { grid-area: primary; }
+#detail-panel {
+  grid-area: detail;
+  position: relative;
+  /* min-width / max-width clamp the drag-resize range so the panel
+     can't disappear entirely (would orphan the resize handle) or
+     grow past viewport (would push the graph panes to negative
+     width). Drag handler also clamps independently. */
+  min-width: 200px;
+  max-width: 80vw;
+}
+#detail-resize-handle {
+  /* 6px-wide handle anchored at the LEFT edge of #detail-panel.
+     Negative left offset places it OVER the boundary so cursor
+     hover hits it from either side. ew-resize cursor signals
+     drag-to-resize affordance. .dragging class adds a faint
+     accent flash so the user sees the active state. */
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 12;
+  background: transparent;
+  transition: background 120ms ease;
+}
+#detail-resize-handle:hover,
+#detail-resize-handle.dragging {
+  background: var(--accent);
+  opacity: 0.32;
+}
+/* Sophie's followup (2026-04-29 evening): center pane also resizable.
+   Symmetric handle at the LEFT edge of #right-pane (between left CFG
+   and right scoped imark panes). Hidden in mode-full-imark since
+   that mode merges the two panes into one primary view. */
+#left-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 12;
+  background: transparent;
+  transition: background 120ms ease;
+}
+#left-resize-handle:hover,
+#left-resize-handle.dragging {
+  background: var(--accent);
+  opacity: 0.32;
+}
+body.mode-full-imark #left-resize-handle { display: none; }
+#right-pane {
+  /* Allow the handle to anchor off the left edge — already
+     position:relative via the shared rule above. min-width clamp
+     mirrors what the drag handler enforces. */
+  min-width: 200px;
+}
+#left-pane { min-width: 200px; }
+#left-pane, #right-pane, #full-pane {
+  position: relative;
+  background: var(--pane-bg);
+  border-right: 1px solid var(--rule);
+  overflow: hidden;
+}
+body.mode-block-guided #full-pane { display: none; }
+body.mode-full-imark   #left-pane,
+body.mode-full-imark   #right-pane { display: none; }
+.pane-label {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  font-size: 10px;
+  color: var(--fg-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 2;
+}
+.cy-canvas { position: absolute; inset: 0; }
+/* LTS-refactor commit 2.6 path C: HTML overlay for edge labels.
+   Layer is transparent and pointer-events:none so the cytoscape
+   canvas underneath keeps its tap/pan/zoom behavior. Each label
+   is its own positioned child div (created/updated/removed via
+   the syncEdgeLabels function on cy events). */
+.label-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 5;
+}
+.html-edge-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* translate(x,y) sets screen position (cytoscape edge midpoint
+     in screen coords); translate(-50%, -50%) centers the label
+     bbox on that point. The collision pass adds further nudges. */
+  transform: translate(0, 0) translate(-50%, -50%);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 8px;
+  color: #d6d0c8;
+  background: rgba(22, 22, 22, 0.78);
+  padding: 1px 4px;
+  border-radius: 2px;
+  /* pre-line: preserve explicit \n in label text but allow wrapping
+     at word boundaries when content exceeds max-width. Caps label
+     width so a 94-char compound guard stacks vertically rather than
+     stretching to a 600px-wide one-liner. */
+  white-space: pre-line;
+  max-width: 220px;
+  line-height: 1.2;
+  /* c2.7.6 (codex c2.7.4 follow-up #1): labels are now clickable.
+     pointer-events: auto on the label only — overlay parent stays
+     pointer-events: none so non-label area still passes clicks through
+     to the cytoscape canvas (node clicks, pan/zoom). After collision
+     resolution moves a label off its edge, the click target is the
+     label box wherever it landed — the click handler reads
+     dataset.transitionIdx and selects the right transition explicitly
+     instead of relying on the canvas edge directly underneath. */
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
+  /* Smooth pan/zoom: avoid sub-pixel rounding flicker. */
+  will-change: transform;
+}
+.html-edge-label:hover {
+  outline: 1px solid #d09050;
+  outline-offset: 1px;
+}
+.html-edge-label.compact {
+  font-size: 7px;
+  max-width: 130px;
+}
+.html-edge-label.kind-exit { color: #b8d0e8; }
+.html-edge-label.kind-default { color: #c8c8c8; }
+.html-edge-label.kind-primitive { color: #c8d8b8; }
+.html-edge-label.boundary { opacity: 0.7; font-style: italic; }
+.html-edge-label.selected {
+  color: #f0a050;
+  background: rgba(58, 42, 24, 0.92);
+  outline: 1px solid #f0a050;
+  z-index: 1;
+}
+/* B2 (idea B): source-range subgraph highlight on overlay labels.
+   The cytoscape edge gets the .in-scope / .out-of-scope class via
+   applySourceRangeHighlight(); syncEdgeLabels mirrors those classes
+   onto the corresponding overlay div. Out-of-scope labels fade so
+   the in-scope subgraph reads as the figure against the rest as
+   ground (Tufte's data-ink ratio applied — fade reduces noise
+   instead of removing it entirely, so the user can still see the
+   surrounding topology context). */
+.html-edge-label.out-of-scope {
+  opacity: 0.18;
+}
+.html-edge-label.in-scope {
+  /* Keep kind-color (kind-exit / default / primitive) for in-scope
+     labels — accent already shows on the edge stroke; doubling it
+     on the label would overwhelm. Bump z-index slightly so in-scope
+     labels render above any out-of-scope overlap. */
+  z-index: 1;
+}
+.empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-faint);
+  font-style: italic;
+  font-size: 12px;
+  pointer-events: none;
+}
+#detail-panel {
+  background: var(--panel-bg);
+  border-left: 1px solid var(--rule);
+  overflow: auto;
+  padding: 16px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.detail h2 {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin: 0 0 8px;
+  font-weight: 500;
+  font-family: -apple-system, "Helvetica Neue", sans-serif;
+}
+.detail .row {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #1a1a1a;
+}
+.detail .row:last-child { border-bottom: none; }
+.detail .k { color: var(--fg-muted); font-size: 11px; }
+.detail .v { color: var(--fg); word-break: break-all; }
+.detail .section-label {
+  /* Section header inside a transition (sub, guard, tgt_smt,
+     exit_flag_status). Visually distinct from field-label rows
+     so the rows below it are obviously children. */
+  display: block;
+  margin-top: 10px;
+  margin-bottom: 4px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 500;
+}
+.detail .section-children {
+  /* Indent rows under a section label so they're visually grouped. */
+  border-left: 1px solid #2a1a08;
+  padding-left: 8px;
+  margin-left: 2px;
+}
+.detail .section-children .row {
+  padding: 2px 0;
+  grid-template-columns: 56px 1fr;
+}
+.detail pre {
+  margin: 6px 0;
+  padding: 8px;
+  background: var(--code-bg);
+  border: 1px solid #1a1a1a;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow: auto;
+  max-height: 240px;
+}
+.detail .placeholder {
+  color: var(--fg-faint);
+  font-style: italic;
+  font-family: -apple-system, "Helvetica Neue", sans-serif;
+}
+.detail section + section { margin-top: 14px; }
+.detail .imark-list {
+  font-size: 11px;
+  color: var(--fg);
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+  gap: 2px 8px;
+}
+.detail .imark-list span {
+  cursor: pointer;
+}
+.detail .imark-list span:hover {
+  color: var(--accent);
+}
+.detail .asm-line {
+  /* ASM disassembly line — prominent typographic treatment so the
+     reader can see "what does this instruction do" at a glance,
+     before drilling into SMT semantics. Direct labels (Tufte):
+     mnemonic + operands are in-place, no key prefix. */
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 14px;
+  background: var(--code-bg);
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  margin: 4px 0 10px 0;
+  word-break: break-all;
+}
+.detail .asm-mnem {
+  color: var(--accent);
+  font-weight: 600;
+}
+.detail .asm-op {
+  color: var(--fg);
+}
+.detail .asm-listing {
+  /* Block-level disassembly — column-aligned PC | mnemonic | operands
+     listing of every imark in the selected block, tufte-style: thin
+     monospace, no row separators (whitespace does the work), click
+     a row to drill into that imark's transition detail. */
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  background: var(--code-bg);
+  padding: 6px 0;
+  border-left: 2px solid var(--accent);
+}
+.detail .asm-listing-line {
+  display: grid;
+  /* c2.7.3: 4-column when source column is present (PC | mnem | op | src);
+     3-column when not (no DWARF / no source mapping for this instr).
+     The .with-src and .no-src classes are set per-row by the renderer. */
+  grid-template-columns: 75px 50px 1fr;
+  gap: 8px;
+  padding: 2px 10px;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.detail .asm-listing-line.with-src {
+  grid-template-columns: 75px 50px 1fr 110px;
+}
+.detail .asm-listing-line:hover {
+  background: rgba(208, 144, 80, 0.10);
+}
+.detail .asm-listing-pc {
+  color: var(--fg-muted);
+}
+.detail .asm-listing-mnem {
+  color: var(--accent);
+  font-weight: 600;
+}
+.detail .asm-listing-op {
+  color: var(--fg);
+  word-break: break-all;
+}
+.detail .asm-listing-src {
+  color: var(--fg-faint);
+  font-size: 10px;
+  text-align: right;
+  align-self: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.detail .asm-listing-src .file { color: var(--fg-muted); }
+.detail .asm-listing-src .line { color: var(--accent); font-weight: 600; }
+.detail .asm-listing-src .file::after { content: ":"; color: var(--fg-faint); }
+
+/* B3 (idea B): transition-index — compact one-row-per-transition
+   list. Used by source-range detail (B3) and reusable for idea A's
+   imark-range + c3's imark sidebar. Tufte: monospace, thin row
+   spacing, no row separators (whitespace + hover do the work),
+   color carries the transition kind for at-a-glance triage. Click
+   row → selectImarkTransition(idx). */
+.detail .transition-index {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  background: var(--code-bg);
+  padding: 6px 0;
+  border-left: 2px solid #6090b0;
+  display: flex;
+  flex-direction: column;
+}
+.detail .transition-index-row {
+  display: grid;
+  /* id | src | arrow | tgt | kind | guard | sub */
+  grid-template-columns: 32px 80px 14px 80px 64px 1fr auto;
+  gap: 6px;
+  padding: 2px 10px;
+  cursor: pointer;
+  line-height: 1.55;
+  align-items: baseline;
+}
+.detail .transition-index-row:hover {
+  background: rgba(208, 144, 80, 0.10);
+}
+.detail .transition-index-row .ti-id {
+  color: var(--accent);
+  font-weight: 600;
+}
+.detail .transition-index-row .ti-src,
+.detail .transition-index-row .ti-tgt {
+  color: var(--fg-muted);
+}
+.detail .transition-index-row .ti-arrow {
+  color: var(--fg-faint);
+  text-align: center;
+}
+.detail .transition-index-row .ti-kind {
+  font-style: italic;
+  color: var(--fg-muted);
+}
+/* Kind-color mirrors the html-edge-label kind tints so the user
+   sees a consistent kind palette across overlay labels and
+   transition-index rows. */
+.detail .transition-index-row.kind-exit .ti-kind { color: #b8d0e8; }
+.detail .transition-index-row.kind-default .ti-kind { color: #c8c8c8; }
+.detail .transition-index-row.kind-primitive .ti-kind { color: #c8d8b8; }
+.detail .transition-index-row .ti-guard {
+  color: var(--fg-muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.detail .transition-index-row .ti-sub {
+  color: var(--fg-faint);
+  font-size: 10px;
+  text-align: right;
+}
+.detail .transition-index-row .ti-sub-empty {
+  color: var(--fg-faint);
+  font-size: 10px;
+  text-align: right;
+  opacity: 0.5;
+}
+
+/* c2.7.4: source-window section. One file group per source file
+   referenced by the selection, with line-numbered code window.
+   Active lines (have ≥1 imark in current selection) get an
+   accent left-border; selected imark's line gets a stronger fill. */
+.detail .source-window {
+  background: var(--code-bg);
+  border-left: 2px solid #6090b0;
+  padding: 6px 0;
+  font-size: 11px;
+  overflow-x: auto;
+}
+.detail .source-window-file-header {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  color: var(--fg-muted);
+  padding: 2px 10px 4px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.detail .source-window-file-header .path { color: var(--fg); font-weight: 500; }
+.detail .source-window-file-header .range { color: var(--fg-faint); }
+.detail .source-line {
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 12px;
+  padding: 1px 10px 1px 0;
+  line-height: 1.55;
+  white-space: pre;
+  cursor: default;
+}
+.detail .source-line.has-insns {
+  cursor: pointer;
+  background: rgba(208, 144, 80, 0.04);
+}
+.detail .source-line.has-insns:hover {
+  background: rgba(208, 144, 80, 0.10);
+}
+.detail .source-line.active {
+  background: var(--selected-bg, #2a1a08);
+  border-left: 3px solid var(--accent);
+  padding-left: 7px;
+}
+/* B1 (idea B): source-range marking. .in-range is applied to every
+   line whose source_line falls within [selected.startLine,
+   selected.endLine] for the selected source-file when
+   selected.type === 'source-range'. Subtle accent tint distinguishes
+   it from .active (single-line pin) and stacks gracefully when both
+   apply (e.g. a range whose endpoint is the same line as a previous
+   imark anchor). */
+.detail .source-line.in-range {
+  background: rgba(208, 144, 80, 0.07);
+}
+.detail .source-line.in-range.has-insns {
+  background: rgba(208, 144, 80, 0.16);
+}
+.detail .source-line.in-range:not(.has-insns) .src {
+  /* Range marking lifts context-line text out of the muted color so
+     in-range non-has-insns lines remain readable as part of the
+     selection. */
+  color: var(--fg);
+}
+/* B1 (idea B): shift-anchor indicator. Set on the line that's the
+   current shift-click anchor (first shift-click set it; second
+   shift-click in the same file forms the range). Dashed border to
+   distinguish from the solid border of .active (single-line pin
+   for imark detail). .active overrides because .active is the
+   stronger semantic (the pinned imark). */
+.detail .source-line.shift-anchor {
+  border-left: 2px dashed var(--accent);
+  padding-left: 8px;
+}
+.detail .source-line.active.shift-anchor {
+  border-left: 3px solid var(--accent);
+  padding-left: 7px;
+}
+.detail .source-line .lineno {
+  color: var(--fg-faint);
+  text-align: right;
+  user-select: none;
+}
+.detail .source-line.has-insns .lineno {
+  color: var(--fg-muted);
+}
+.detail .source-line.active .lineno {
+  color: var(--accent);
+  font-weight: 600;
+}
+.detail .source-line .src { color: var(--fg); }
+.detail .source-line:not(.has-insns) .src { color: var(--fg-muted); }
+.detail .source-window-empty {
+  padding: 6px 12px;
+  color: var(--fg-faint);
+  font-style: italic;
+}
+footer.footnote {
+  height: 30px;
+  padding: 6px 16px;
+  border-top: 1px solid var(--rule);
+  font-size: 11px;
+  color: var(--fg-muted);
+  display: flex;
+  align-items: center;
+}
+footer.footnote code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--code-bg);
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: var(--fg);
+}
+</style>
+</head>
+<body class="mode-block-guided">
+<header class="toolbar">
+  <span class="title">tsm_utf8_mach_feed — instruction + block view<span class="v">v0</span></span>
+  <span class="mode-toggle">
+    <button id="btn-block-guided" class="active">Block-guided</button>
+    <button id="btn-full-imark">Full instruction graph</button>
+  </span>
+  <span class="helper-text" id="helper-text">Click a block to drill into its instruction decomposition.</span>
+  <span class="helper-text" id="lts-counts" style="margin-left:auto;"></span>
+</header>
+<main>
+  <div id="left-pane">
+    <div class="pane-label">Block CFG · quotient of instruction LTS</div>
+    <div class="cy-canvas" id="cy-block"></div>
+    <!-- HTML overlay layer: edge labels rendered as DOM elements
+         instead of cytoscape canvas labels. Pixel-perfect positioning
+         + DOM-based collision detection independent of edge geometry. -->
+    <div class="label-overlay" id="overlay-block"></div>
+  </div>
+  <div id="right-pane">
+    <!-- Drag-resize handle at the left edge of the right pane.
+         Mousedown → install document-level mousemove/mouseup to
+         update --left-width on <main>. Symmetric to detail-resize-
+         handle but for the left↔right divider. -->
+    <div id="left-resize-handle" title="Drag to resize"></div>
+    <div class="pane-label">Instructions in selected block</div>
+    <div class="cy-canvas" id="cy-imark-scoped"></div>
+    <div class="label-overlay" id="overlay-scoped"></div>
+    <div class="empty-state" id="right-empty">click a block ←</div>
+  </div>
+  <div id="full-pane">
+    <div class="pane-label">Full instruction LTS · all transitions</div>
+    <div class="cy-canvas" id="cy-imark-full"></div>
+    <div class="label-overlay" id="overlay-full"></div>
+  </div>
+  <aside id="detail-panel">
+    <!-- Drag-resize handle at the left edge of the detail panel.
+         Mousedown → install document-level mousemove/mouseup
+         listeners that update --detail-width on <main>. -->
+    <div id="detail-resize-handle" title="Drag to resize"></div>
+    <div id="detail-content" class="detail">
+      <h2>Detail</h2>
+      <p class="placeholder">Select a block or instruction.</p>
+    </div>
+  </aside>
+</main>
+<footer class="footnote">
+  Block view is a quotient/projection of the instruction LTS via <code>basic_blocks</code>. <code>I.3</code> (composition pass) will attach proof/quotient metadata here.
+</footer>
+
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+
+<script>
+'use strict';
+
+const LTS_PATH = 'tsm_utf8_mach_feed.imark.lts.json';
+const BLOCK_LTS_PATH = 'tsm_utf8_mach_feed.lts.json'; // legacy block-granular extraction; its
+
+// c2.7.5 (gist hosting): when this page is served via gisthost.github.io
+// (a static loader that fetches gist files via the GitHub API and
+// renders them), relative-URL fetches resolve against gisthost.github.io
+// itself, NOT the gist origin. Result: `fetch('foo.json')` 404s.
+//
+// Detect gisthost at runtime, look up the file's actual raw URL via
+// the GitHub gist API (returns file.raw_url version-pinned by SHA),
+// and fetch from there. Local serving (any other origin) keeps the
+// relative-path fetch. No hardcoded usernames — gist API handles that.
+//
+// Gisthost URL shape: https://gisthost.github.io/?<gist_id>/<filename>
+let _gistFilesCache = null;
+async function fetchLtsJson(filename) {
+  const loc = window.location;
+  if (loc.hostname === 'gisthost.github.io') {
+    const q = (loc.search || '').replace(/^\?/, '');
+    const gist_id = q.split('/')[0];
+    if (gist_id) {
+      if (!_gistFilesCache) {
+        const apiResp = await fetch(`https://api.github.com/gists/${gist_id}`);
+        if (apiResp.ok) {
+          const gist = await apiResp.json();
+          _gistFilesCache = gist.files || {};
+        } else {
+          _gistFilesCache = {};
+        }
+      }
+      const file = _gistFilesCache[filename];
+      if (file && file.raw_url) {
+        const r = await fetch(file.raw_url);
+        if (!r.ok) throw new Error(`gist raw fetch ${filename}: ${r.status}`);
+        return r.json();
+      }
+      throw new Error(`gist file not found: ${filename}`);
+    }
+  }
+  const r = await fetch(filename, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`fetch ${filename}: ${r.status}`);
+  return r.json();
+}
+                                                       // per-block transitions ARE the
+                                                       // composed-imark relational transformers
+                                                       // we'd otherwise compute via Voogd I.3.
+
+// =====================================================================
+// State + indices
+// =====================================================================
+
+let lts = null;            // raw imark LTS JSON
+let blockLts = null;       // legacy block-granular LTS (composed-effect source)
+let pcToBlock = {};        // hex-string PC -> hex-string block addr
+let blockOrder = [];       // ordered array of block addrs (entry first if possible)
+let blockToImarks = {};    // hex-string block addr -> [hex-string PC]
+let pcToInsn = {};         // hex-string PC -> {mnemonic, op_str, size, ...} (I.2.6b)
+let blockToBlockTransitions = {}; // hex-string block addr -> [block-level transition dicts
+                                  // from the legacy block-granular LTS, which carry the
+                                  // composed-imark sub directly]
+let entryAddr = null;
+let cyBlock = null;
+let cyScoped = null;
+let cyFull = null;
+// LTS-refactor commit 1: unified selected-entity state. Replaces
+// the previous separate selectedBlock/selectedImark booleans-of-
+// presence with one tagged selection object. Codex's
+// recommendation: 'replace the implicit selectedBlock /
+// selectedImark model with one selected entity object ... avoids
+// reintroducing ambiguity.'
+//
+// Shape:
+//   null                                          — nothing selected
+//   { type: 'imark-node',       pc: '0x...' }     — control location at
+//                                                   program-counter value pc
+//   { type: 'imark-transition', idx: <int>,       — Voogd branch from imark LTS
+//                               pc: '0x...' }       (pc cached for convenience)
+//   { type: 'block-node',       addr: '0x...' }   — control location at block
+//                                                   entry program-counter value
+//   { type: 'block-transition', idx: <int>,       — composed-block transition
+//                               addr: '0x...' }     from block-granular LTS
+//
+// FUTURE variants (declared here so the type union is the source of
+// truth for new selection modes; renderers/highlighters land in the
+// commit chain that introduces each idea):
+//   { type: 'source-range',     source_file: '...', — sophie's idea B:
+//                               startLine: <int>,    range of source lines
+//                               endLine: <int>,      selected via shift-click
+//                               pcs: [...] }         in source window. pcs
+//                                                    is the union of imark
+//                                                    program-counter values
+//                                                    whose source_line
+//                                                    falls in [startLine,
+//                                                    endLine] (scoped to the
+//                                                    selected source file).
+//   { type: 'imark-range',      pcs: [...],         — sophie's idea A:
+//                               transitionIdxs: [...], contiguous range of
+//                               rangeKind: 'linear'  imarks. rangeKind
+//                                       | 'branching'  classifies the connect-
+//                                       | 'disconnected' ivity (linear =
+//                                                    successor chain, branching
+//                                                    = multiple outgoing edges
+//                                                    inside range, disconnected
+//                                                    = gaps). UI honesty:
+//                                                    composed-effect display
+//                                                    only when range exactly
+//                                                    matches a basic_block
+//                                                    (real LTS data); arbitrary
+//                                                    ranges show enumeration
+//                                                    of constituent transitions.
+let selected = null;
+
+// B1 (idea B): anchor for shift-click range selection in source
+// window. Plain-click on a `.source-line` updates the anchor;
+// shift-click reads it to compute the range endpoints. Resets to
+// null on LTS reload. Anchor is per-file: shift-click only forms
+// a range when click and anchor share the same source_file.
+let _sourceClickAnchor = null;
+
+// A1 (idea A): anchor for shift-click range selection on imark
+// nodes in the cytoscape graphs (cyScoped / cyFull). pc-string of
+// the anchor imark, or null. Shift-click in either imark graph
+// reads/writes this; cross-graph anchoring works (anchor in cyFull,
+// extend in cyScoped) since they index by pc-string. Block-scoped
+// in v0 — second shift-click only forms a range if it's in the
+// same block as the anchor (cross-block ranges would need path-
+// finding through transitions; v0 limits to instruction_pcs slice
+// within one basic_block, which matches sophie's '0x40a7bc through
+// 0x40a7c9' example).
+let _imarkClickAnchor = null;
+
+// Compatibility accessors so the rest of the code can still ask
+// 'is a block selected' / 'which imark is selected' until it
+// migrates to selected.type-aware logic. These derive from the
+// unified `selected` state.
+function selectedBlockAddr() {
+  if (!selected) return null;
+  if (selected.type === 'block-node') return selected.addr;
+  if (selected.type === 'block-transition') return selected.addr;
+  if (selected.type === 'imark-node' && selected.pc) return pcToBlock[selected.pc] || null;
+  if (selected.type === 'imark-transition' && selected.pc) return pcToBlock[selected.pc] || null;
+  return null;
+}
+function selectedImarkPc() {
+  if (!selected) return null;
+  if (selected.type === 'imark-node') return selected.pc;
+  if (selected.type === 'imark-transition') return selected.pc;
+  return null;
+}
+
+// =====================================================================
+// Tufte-flavored stylesheets
+//
+// Cytoscape stylesheet values do NOT resolve CSS custom properties
+// (var(--*)). We mirror the CSS theme values here as plain strings.
+// =====================================================================
+
+const THEME = {
+  bg: '#161616',
+  fg: '#e8e8e8',
+  fgMuted: '#888888',
+  fgFaint: '#555555',
+  accent: '#d09050',
+  selected: '#f0a050',
+  selectedText: '#161616',
+  nodeFill: '#2a2a2a',
+  nodeFillSelected: '#f0a050',
+  nodeFillRelated: '#6a4a20',
+  nodeStroke: '#555555',
+  nodeStrokeSelected: '#ffd080',
+  edge: '#4a4a4a',
+  edgeActive: '#d09050',
+  exitEdge: '#7090c0',
+  primitiveEdge: '#90b070',
+};
+
+function blockStyle() {
+  return [
+    {
+      selector: 'node',
+      style: {
+        'background-color': THEME.nodeFill,
+        'border-color': THEME.nodeStroke,
+        'border-width': 1,
+        'label': 'data(label)',
+        'color': THEME.fg,
+        'font-family': 'ui-monospace, Menlo, monospace',
+        'font-size': 9,
+        'text-wrap': 'wrap',
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'shape': 'round-rectangle',
+        // Use width/height = "label" via fixed dimensions + padding
+        // (the literal "label" string was deprecated in cytoscape 3.30+).
+        'width': 64,
+        'height': 28,
+        'padding': '6px',
+      },
+    },
+    {
+      selector: 'node[?isEntry]',
+      style: { 'border-color': THEME.accent, 'border-width': 2 },
+    },
+    {
+      selector: 'node.related',
+      style: { 'background-color': THEME.nodeFillRelated, 'border-color': THEME.accent },
+    },
+    // B2 (idea B): source-range subgraph highlight. .in-scope marks
+    // a node whose pc/addr falls inside the active source-range
+    // selection; .out-of-scope fades unrelated nodes so the matching
+    // subgraph reads cleanly without occluding ambient context.
+    // Tufte-restraint applied — the in-scope node uses the existing
+    // related accent tint (consistent with the .related semantic
+    // family), the out-of-scope node uses opacity rather than color
+    // change so the topology stays legible.
+    {
+      selector: 'node.in-scope',
+      style: { 'background-color': THEME.nodeFillRelated, 'border-color': THEME.accent },
+    },
+    {
+      selector: 'node.out-of-scope',
+      style: { 'opacity': 0.22 },
+    },
+    // B2.1 (codex B2 [Low]): node:selected placed AFTER B2 .in-scope /
+    // .out-of-scope so user selection wins over source-range scope
+    // marking when both classes coexist. Mutators currently enforce
+    // mutual exclusion (selectImark clears in-scope; selectSourceRange
+    // clears :selected) but defensive ordering protects future
+    // selection-mixing scenarios (e.g., B3 transition-index rows
+    // navigating to imark-transition while the user keeps a stale
+    // source-range view open).
+    {
+      selector: 'node:selected',
+      style: {
+        'background-color': THEME.nodeFillSelected,
+        'color': THEME.selectedText,
+        'border-color': THEME.nodeStrokeSelected,
+        'border-width': 2,
+      },
+    },
+    {
+      selector: 'edge',
+      style: {
+        'curve-style': 'bezier',
+        'line-color': THEME.edge,
+        'target-arrow-color': THEME.edge,
+        'target-arrow-shape': 'triangle',
+        'arrow-scale': 0.8,
+        'width': 1,
+        'font-size': 8,
+        'color': THEME.fgMuted,
+        'text-background-opacity': 0,
+        'text-margin-y': -4,
+      },
+    },
+    {
+      // Only emit text on edges that actually carry a label string —
+      // intra-block imark transitions have label="" and trigger the
+      // "no mapping" warning if we apply data(label) globally.
+      selector: 'edge[label]',
+      style: { 'label': 'data(label)' },
+    },
+    {
+      selector: 'edge.active',
+      style: { 'line-color': THEME.edgeActive, 'target-arrow-color': THEME.edgeActive, 'width': 2 },
+    },
+  ];
+}
+
+function imarkStyle({ compact = false } = {}) {
+  const base = blockStyle();
+  // c2.6 path C: HTML overlay renders edge labels — suppress cytoscape's
+  // canvas label rendering for imark graphs by clearing the label
+  // property on the inherited edge[label] rule. Edge data.label is
+  // still read by syncEdgeLabels() for the overlay.
+  const cyLabelRule = base.find(r => r.selector === 'edge[label]');
+  if (cyLabelRule) cyLabelRule.style = {};
+  // Per-context tweaks for imark scale.
+  const nodeRule = base.find(r => r.selector === 'node');
+  nodeRule.style['font-size'] = compact ? 7 : 8;
+  nodeRule.style['padding'] = compact ? '3px' : '4px';
+  // LTS-refactor commit 2.5: scoped state nodes are now PC-only
+  // (instruction text moved to outgoing edge labels) so they no
+  // longer need to fit "0x40a7bc push". 80px is enough for a 10-char
+  // hex address.
+  nodeRule.style['width'] = compact ? 40 : 80;
+  nodeRule.style['height'] = compact ? 18 : 22;
+  const edgeRule = base.find(r => r.selector === 'edge');
+  edgeRule.style['width'] = 0.7;
+  edgeRule.style['arrow-scale'] = 0.6;
+  // LTS-refactor commit 2.5: edge labels carry the action-language
+  // text (instructionActionLabel). The `edge[label]` selector above
+  // (in blockStyle) emits data(label); these rules set imark-scale
+  // typography. Per-context text-max-width keeps full-pane density
+  // tolerable while letting scoped pane labels read cleanly.
+  base.push({
+    selector: 'edge[label]',
+    style: {
+      'font-size': compact ? 7 : 8,
+      'font-family': 'ui-monospace, Menlo, monospace',
+      'color': '#d6d0c8',
+      'text-wrap': 'wrap',
+      'text-max-width': compact ? 130 : 220,
+      // Background pill keeps the label readable when it overlaps
+      // edge strokes from other transitions in dense regions.
+      'text-background-color': THEME.bg || '#161616',
+      'text-background-opacity': 0.78,
+      'text-background-padding': 2,
+      'text-background-shape': 'roundrectangle',
+      'text-margin-y': -2,
+    },
+  });
+  // Color edges by transition kind.
+  base.push({
+    selector: 'edge[kind = "exit"]',
+    style: { 'line-color': THEME.exitEdge, 'target-arrow-color': THEME.exitEdge },
+  });
+  base.push({
+    selector: 'edge[kind = "primitive"]',
+    style: { 'line-color': THEME.primitiveEdge, 'target-arrow-color': THEME.primitiveEdge },
+  });
+  base.push({
+    selector: 'edge[?isBoundary]',
+    style: {
+      'line-style': 'dashed',
+      'line-color': THEME.fgFaint,
+      'target-arrow-color': THEME.fgFaint,
+      'opacity': 0.6,
+    },
+  });
+  base.push({
+    selector: 'node[?isStub]',
+    style: {
+      'background-color': '#181818',
+      'border-color': THEME.fgFaint,
+      'border-style': 'dashed',
+      'color': THEME.fgFaint,
+    },
+  });
+  // A1 (idea A): shift-click anchor visual on an imark node. First
+  // shift-click sets the anchor (no navigation, this style applied);
+  // second shift-click in the same block forms an imark-range and
+  // clears the anchor. Dashed accent border distinguishes from
+  // .selected (solid) and .related (filled). Cross-graph: when an
+  // anchor is set on cyScoped, the same pc-id node in cyFull gets
+  // the same class.
+  base.push({
+    selector: 'node.shift-anchor',
+    style: {
+      'border-color': THEME.accent,
+      'border-width': 2,
+      'border-style': 'dashed',
+    },
+  });
+  // B2 (idea B): edge subgraph highlight. .in-scope edges (whose src
+  // pc is in the active source-range pcs set) get the accent stroke
+  // and slightly thicker stroke so they pop against the .out-of-scope
+  // faded neighbors. Placed AFTER kind-color rules so it overrides
+  // them. B2.1 (codex B2 [Low]): edge:selected moved AFTER these so
+  // :selected wins when both classes coexist (mutators enforce mutual
+  // exclusion at runtime; this ordering is defensive against future
+  // selection-mixing in B3 / c3).
+  base.push({
+    selector: 'edge.in-scope',
+    style: {
+      'line-color': THEME.accent,
+      'target-arrow-color': THEME.accent,
+      'width': 1.4,
+      'opacity': 1.0,
+    },
+  });
+  base.push({
+    selector: 'edge.out-of-scope',
+    style: { 'opacity': 0.15 },
+  });
+  // LTS-refactor commit 2: selected-edge style. Placed AFTER the
+  // kind-based color rules so it overrides them when the edge is
+  // selected (cytoscape style precedence: same specificity → later
+  // wins). codex c2: thicker stroke + accent color, no glow/animation.
+  // The detail panel header carries kind/jumpkind/guard so the
+  // semantic distinction (exit vs default vs primitive) survives the
+  // color normalization on the selected edge itself. B2.1: also
+  // placed AFTER the B2 .in-scope/.out-of-scope rules so :selected
+  // wins on edges as well.
+  base.push({
+    selector: 'edge:selected',
+    style: {
+      'line-color': THEME.selected,
+      'target-arrow-color': THEME.selected,
+      'width': 2.5,
+      'arrow-scale': 0.9,
+      'z-compound-depth': 'top',
+    },
+  });
+  return base;
+}
+
+
+// =====================================================================
+// Init pipeline
+// =====================================================================
+
+async function init() {
+  // cache: 'no-store' on both LTS fetches so iterating on extraction
+  // (re-running the extractor and refreshing the page) doesn't get
+  // bitten by stale browser cache. v0 viewer is a debugging tool;
+  // bandwidth cost of bypassing cache is negligible (LTS files are
+  // ~200KB each).
+  try {
+    lts = await fetchLtsJson(LTS_PATH);
+  } catch (err) {
+    document.getElementById('detail-content').innerHTML =
+      `<h2>Error</h2><pre>${escapeHtml(err.message)}</pre>` +
+      `<p class="placeholder">Expected ${LTS_PATH} alongside this HTML.</p>`;
+    return;
+  }
+  // Block-granular LTS is optional; viewer degrades gracefully (no
+  // composed-block-sub view) if missing. The legacy gist regen
+  // produces it from QFABV_BACKEND=angr (block-granular default);
+  // its per-block transitions carry the composed sub we want.
+  try {
+    blockLts = await fetchLtsJson(BLOCK_LTS_PATH);
+  } catch (e) {
+    blockLts = null;
+  }
+  // Validate the block-granular LTS aligns with the imark LTS — if a
+  // user drops in a stale or wrong-binary block-granular file, the
+  // composed-effect view would silently lie. (Codex's catch-up
+  // [Medium] finding: 'failing to validate alignment is the regret
+  // risk' for the dual-LTS strategy.) Mismatches null-out blockLts
+  // and surface a diagnostic; viewer falls back to the no-block-LTS
+  // graceful-empty state.
+  if (blockLts) {
+    const mismatch = validateBlockLtsAlignment(lts, blockLts);
+    if (mismatch) {
+      console.warn('[imark viewer] block-granular LTS rejected:', mismatch);
+      window.__imarkBlockLtsMismatch = mismatch;
+      blockLts = null;
+    }
+  }
+  // v0 viewer assumes a single function in function_index. tsm
+  // ships with one (tsm_utf8_mach_feed) and that is fine for now;
+  // sha1 / lua targets have multiple. Codex catch-up [Low]: surface
+  // explicitly so the silent-pick-first behavior doesn't mask an
+  // actually-multi-function LTS later. v1 will add a target/function
+  // selector dropdown.
+  if (lts.function_index && lts.function_index.length > 1) {
+    console.warn(
+      `[imark viewer] LTS has ${lts.function_index.length} functions; ` +
+      `v0 viewer shows function_index[0] only ` +
+      `(${lts.function_index[0]?.name ?? '<unnamed>'}). ` +
+      `Multi-function selector deferred to v1.`
+    );
+  }
+  buildIndices();
+  document.getElementById('lts-counts').textContent =
+    `${blockOrder.length} blocks · ${lts.transitions.length} instruction transitions · granularity=${lts.granularity}`;
+  buildBlockGraph();
+  buildFullImarkGraph();
+  wireToggle();
+  wireSelections();
+  wireDetailResize();
+  // Default focus: function entry block.
+  if (entryAddr) {
+    selectBlock(entryAddr, { source: 'init' });
+  }
+}
+
+function buildIndices() {
+  const fn = lts.function_index[0];
+  entryAddr = fn.entry_addr;
+  blockOrder = (fn.basic_blocks || []).map(bb => bb.addr);
+  pcToBlock = {};
+  blockToImarks = {};
+  for (const bb of fn.basic_blocks || []) {
+    blockToImarks[bb.addr] = bb.instruction_pcs;
+    for (const pc of bb.instruction_pcs) {
+      pcToBlock[pc] = bb.addr;
+    }
+  }
+  // I.2.6b: pc -> insn metadata (mnemonic, op_str, size, ...) so the
+  // detail panel can show ASM without re-disassembling. Keep the
+  // map empty when the LTS lacks an `instructions` field (older
+  // extractions before I.2.6b will fall back gracefully).
+  pcToInsn = {};
+  for (const ins of fn.instructions || []) {
+    pcToInsn[ins.pc] = ins;
+  }
+  // Block-granular transitions (composed-effect view): index by src
+  // (which equals block addr in the block-granular LTS schema). One
+  // block can have multiple transitions (Jcc terminator → exit +
+  // default; ret → tgt_smt; call → callee). The block detail panel
+  // renders these in the same SUB · RELATIONAL TRANSFORMER style as
+  // the per-imark detail panel — they ARE the composed sub.
+  blockToBlockTransitions = {};
+  if (blockLts && Array.isArray(blockLts.transitions)) {
+    for (const t of blockLts.transitions) {
+      const src = t.src;
+      if (!blockToBlockTransitions[src]) blockToBlockTransitions[src] = [];
+      blockToBlockTransitions[src].push(t);
+    }
+  }
+}
+
+// =====================================================================
+// Block CFG (quotient view)
+// =====================================================================
+
+function quotientBlockEdges() {
+  // c4-fallback: this is now only used when the block-granular LTS
+  // is missing/mismatched (blockLts === null after alignment
+  // validation). When blockLts IS loaded, realBlockEdges() below
+  // returns one edge per blockLts.transitions entry — LTS-correct
+  // and selectable per transition.
+  //
+  // Map "src->tgt" -> { count, kindCounts }
+  const edges = new Map();
+  for (const t of lts.transitions) {
+    const srcBlock = pcToBlock[t.src];
+    if (!srcBlock) continue;
+    let tgtBlock = null;
+    if (t.tgt != null) {
+      tgtBlock = pcToBlock[t.tgt] || null;
+    }
+    if (!tgtBlock) {
+      // Cross-function (call/ret) — skip in v0 block CFG.
+      continue;
+    }
+    if (srcBlock === tgtBlock) continue;
+    const key = `${srcBlock}->${tgtBlock}`;
+    const e = edges.get(key) || { src: srcBlock, tgt: tgtBlock, count: 0 };
+    e.count++;
+    edges.set(key, e);
+  }
+  return [...edges.values()];
+}
+
+// c4 (sophie's followup, post-c2.7.4 plan): real block-LTS edges.
+// One cytoscape edge per blockLts.transitions entry — the LTS-correct
+// shape (LTS = one edge per transition, NOT per pair-of-blocks). Each
+// edge gets stable transitionIdx, kind/jumpkind/guard data, and is
+// selectable via cyBlock edge taps → selectBlockTransition.
+//
+// c4.2 (codex c4.1 [Medium]): returns null when blockLts is
+// UNAVAILABLE (missing/mismatched — caller falls back to
+// quotientBlockEdges for the legacy ×N view). Returns [] when
+// blockLts is AVAILABLE but no in-function-renderable edges (e.g.
+// single-block / ret-only function with all transitions targeting
+// null/external). Caller distinguishes these via `=== null` so an
+// available-but-empty block-LTS doesn't reintroduce the quotient
+// view.
+//
+// c4.1 (codex c4 [Medium]): explicitly filter cross-function targets.
+// blockLts.transitions can target callee addresses outside the current
+// function's basic_blocks set; cytoscape would then get an edge whose
+// target node does not exist (fails silently or breaks layout). The
+// blocksInFunction set scopes edges to within-function transitions.
+// Cross-function transitions (calls/jumps to other functions) get the
+// same treatment as null-tgt rets — skipped here, surfaced via the
+// block-detail composed-effect section that lists the transitions
+// regardless.
+function realBlockEdges() {
+  if (!blockLts || !Array.isArray(blockLts.transitions)) return null;
+  const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+  if (!fn) return null;
+  const blocksInFunction = new Set((fn.basic_blocks || []).map(bb => bb.addr));
+  const edges = [];
+  blockLts.transitions.forEach((t, idx) => {
+    const srcBlock = t.src;
+    const tgtBlock = t.tgt;
+    // tgt can be null for symbolic-ret transitions (e.g. function
+    // exit). Skip those for now — they'd need a "ret stub" target
+    // node like the imark graph has.
+    if (!srcBlock || !tgtBlock) return;
+    // Cross-function: skip transitions whose tgt isn't in this
+    // function's basic_blocks. (src is always in the function by
+    // construction since blockLts is per-function, but we check
+    // both defensively.)
+    if (!blocksInFunction.has(srcBlock) || !blocksInFunction.has(tgtBlock)) return;
+    edges.push({
+      data: {
+        id: `block-e-${idx}`,
+        source: srcBlock,
+        target: tgtBlock,
+        transitionIdx: idx,
+        kind: t.kind,
+        jumpkind: t.jumpkind || '',
+        guard: t.guard || '',
+        // Canvas label: just kind keeps cyBlock readable. (HTML overlay
+        // for cyBlock could come later if more detail per edge needed.)
+        label: t.kind,
+      },
+    });
+  });
+  return edges;
+}
+
+function buildBlockGraph() {
+  const fn = lts.function_index[0];
+  const blockNodes = (fn.basic_blocks || []).map(bb => ({
+    data: {
+      id: bb.addr,
+      label: `${bb.addr}\n${bb.instruction_pcs.length} insns`,
+      insnCount: bb.instruction_pcs.length,
+      size: bb.size,
+      isEntry: bb.addr === entryAddr ? 1 : 0,
+    },
+  }));
+  // c4: prefer real block-LTS edges (one per blockLts transition,
+  // LTS-correct + selectable). Fall back to the legacy quotient ×N
+  // view only when blockLts is missing/mismatched (validation drops
+  // it earlier in init).
+  // c4.2 (codex c4.1 [Medium]): realBlockEdges() returns null on
+  // unavailable, [] on available-but-empty. Distinguish so an
+  // available-but-empty block-LTS (e.g. single-block function with
+  // only ret transitions) renders no edges instead of incorrectly
+  // re-introducing the quotient ×N view.
+  const realEdges = realBlockEdges();
+  const blockEdges = realEdges !== null
+    ? realEdges
+    : quotientBlockEdges().map(e => {
+        const data = {
+          id: `${e.src}->${e.tgt}`,
+          source: e.src,
+          target: e.tgt,
+          count: e.count,
+        };
+        if (e.count > 1) data.label = `×${e.count}`;
+        return { data };
+      });
+  cyBlock = cytoscape({
+    container: document.getElementById('cy-block'),
+    elements: [...blockNodes, ...blockEdges],
+    style: blockStyle(),
+    layout: { name: 'dagre', rankDir: 'TB', nodeSep: 24, rankSep: 50, edgeSep: 6 },
+    wheelSensitivity: 0.2,
+    // Single selection — clicking a new node deselects the previous
+    // (sophie's "must" for v0). Default cytoscape allows multi-select
+    // via cmd-click; we don't want that ambiguity.
+    selectionType: 'single',
+  });
+}
+
+// =====================================================================
+// Scoped imark view (for selected block)
+// =====================================================================
+
+function rebuildScopedImarkGraph(blockAddr) {
+  const container = document.getElementById('cy-imark-scoped');
+  const empty = document.getElementById('right-empty');
+  if (!blockAddr || !blockToImarks[blockAddr]) {
+    if (cyScoped) { cyScoped.destroy(); cyScoped = null; }
+    container.innerHTML = '';
+    // c2.6 path C: also clear stale overlay labels when no block.
+    const overlay = document.getElementById('overlay-scoped');
+    if (overlay) overlay.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  // Block-rebuild: clear overlay labels first; the new sync after
+  // cyScoped finishes layout will repopulate fresh divs.
+  const overlay = document.getElementById('overlay-scoped');
+  if (overlay) overlay.innerHTML = '';
+  empty.style.display = 'none';
+  const imarks = new Set(blockToImarks[blockAddr]);
+  const nodes = blockToImarks[blockAddr].map(pc => {
+    // LTS-refactor commit 2.5: state nodes are control-location-only.
+    // The instruction text moved to outgoing edge labels via
+    // instructionActionLabel — see option E in the ontology brainstorm.
+    return { data: { id: pc, label: pc, isStub: 0 } };
+  });
+  // Track stubs we've already added so we only emit one stub per
+  // boundary-target.
+  const stubIds = new Set();
+  const edges = [];
+  // LTS-refactor commit 2: iterate with explicit transition index so
+  // each cytoscape edge gets a stable ID = `imark-e-${idx}`. The same
+  // LTS transition idx now identifies the edge in BOTH cyScoped and
+  // cyFull (separate cytoscape instances, so no namespace collision).
+  // This is what makes selectImarkTransition(idx) work uniformly.
+  lts.transitions.forEach((t, idx) => {
+    if (!imarks.has(t.src)) return;
+    let tgtId;
+    let isBoundary = 0;
+    if (t.tgt == null) {
+      tgtId = `__ret_${t.src}`;
+      isBoundary = 1;
+      if (!stubIds.has(tgtId)) {
+        nodes.push({ data: { id: tgtId, label: 'ret', isStub: 1 } });
+        stubIds.add(tgtId);
+      }
+    } else if (imarks.has(t.tgt)) {
+      tgtId = t.tgt;
+    } else {
+      // Boundary edge: tgt is in another block (or external).
+      const tgtBlockAddr = pcToBlock[t.tgt];
+      const tgtLabel = tgtBlockAddr
+        ? `→ ${tgtBlockAddr}\n${t.tgt}`
+        : `→ ${t.tgt}`;
+      tgtId = `__boundary_${t.tgt}`;
+      isBoundary = 1;
+      if (!stubIds.has(tgtId)) {
+        nodes.push({
+          data: { id: tgtId, label: tgtLabel, isStub: 1, boundaryTgt: t.tgt, boundaryBlock: tgtBlockAddr },
+        });
+        stubIds.add(tgtId);
+      }
+    }
+    edges.push({
+      data: {
+        id: `imark-e-${idx}`,
+        source: t.src,
+        target: tgtId,
+        kind: t.kind,
+        jumpkind: t.jumpkind,
+        isBoundary,
+        transitionIdx: idx,
+        srcPc: t.src,
+        tgtPc: t.tgt,
+        label: instructionActionLabel(t),
+      },
+    });
+  });
+  if (cyScoped) cyScoped.destroy();
+  cyScoped = cytoscape({
+    container,
+    elements: [...nodes, ...edges],
+    style: imarkStyle({ compact: false }),
+    // c2.5 had bumped rankSep 28→48 to give canvas edge labels vertical
+    // breathing room. Reverted to original 28 in this commit since
+    // labels are now html-overlay (positioned independently of dagre's
+    // rank-spacing), so dagre can pack ranks tighter without label
+    // collisions. The bump was carrying weight that's no longer needed.
+    layout: { name: 'dagre', rankDir: 'TB', nodeSep: 16, rankSep: 28 },
+    wheelSensitivity: 0.2,
+    selectionType: 'single',
+  });
+  cyScoped.on('tap', 'node', evt => {
+    const data = evt.target.data();
+    if (data.isStub) {
+      if (data.boundaryBlock) {
+        selectBlock(data.boundaryBlock, { source: 'boundary' });
+      }
+      return;
+    }
+    const pc = data.id;
+    // A1 (idea A): shift-click → imark-range selection. Two-step UX
+    // mirroring B's source-line range: first shift-click sets the
+    // anchor without navigating; second shift-click in the same block
+    // forms the range. Cross-block shift-click resets the anchor (idea
+    // A is block-scoped in v0).
+    const shiftKey = !!(evt.originalEvent && evt.originalEvent.shiftKey);
+    if (shiftKey) {
+      const anchorBlock = _imarkClickAnchor ? pcToBlock[_imarkClickAnchor] : null;
+      const clickBlock = pcToBlock[pc];
+      if (!_imarkClickAnchor || anchorBlock !== clickBlock) {
+        _imarkClickAnchor = pc;
+        cyScoped.elements('.shift-anchor').removeClass('shift-anchor');
+        if (cyFull) cyFull.elements('.shift-anchor').removeClass('shift-anchor');
+        evt.target.addClass('shift-anchor');
+        const fullNode = cyFull ? cyFull.getElementById(pc) : null;
+        if (fullNode && fullNode.length) fullNode.addClass('shift-anchor');
+        return;
+      }
+      selectImarkRange(_imarkClickAnchor, pc, { source: 'scoped-shift' });
+      return;
+    }
+    selectImark(pc, { source: 'scoped' });
+  });
+  // LTS-refactor commit 2: edges are now first-class clickable
+  // entities — each represents one LTS transition (Voogd branch).
+  cyScoped.on('tap', 'edge', evt => {
+    const idx = evt.target.data('transitionIdx');
+    selectImarkTransition(idx, { source: 'scoped' });
+  });
+  // c2.6 path C: HTML overlay for scoped pane edge labels.
+  installLabelOverlay(cyScoped, document.getElementById('overlay-scoped'), { compact: false });
+}
+
+// =====================================================================
+// Full imark graph (mode B / option A)
+// =====================================================================
+
+function buildFullImarkGraph() {
+  const nodes = [];
+  const seenNodes = new Set();
+  const edges = [];
+  // LTS-refactor commit 2: edge ID = `imark-e-${idx}` (same scheme as
+  // cyScoped, separate cytoscape instance namespace).
+  lts.transitions.forEach((t, idx) => {
+    if (!seenNodes.has(t.src)) {
+      const block = pcToBlock[t.src];
+      nodes.push({ data: { id: t.src, label: t.src, block, isStub: 0 } });
+      seenNodes.add(t.src);
+    }
+    let tgtId, isStub = 0;
+    if (t.tgt == null) {
+      tgtId = `__ret_${t.src}`;
+      if (!seenNodes.has(tgtId)) {
+        nodes.push({ data: { id: tgtId, label: 'ret', isStub: 1 } });
+        seenNodes.add(tgtId);
+      }
+      isStub = 1;
+    } else {
+      tgtId = t.tgt;
+      if (!seenNodes.has(tgtId) && pcToBlock[tgtId]) {
+        nodes.push({ data: { id: tgtId, label: tgtId, block: pcToBlock[tgtId], isStub: 0 } });
+        seenNodes.add(tgtId);
+      } else if (!seenNodes.has(tgtId)) {
+        // External tgt (call site) — render as stub node.
+        nodes.push({ data: { id: tgtId, label: tgtId, isStub: 1 } });
+        seenNodes.add(tgtId);
+        isStub = 1;
+      }
+    }
+    edges.push({
+      data: {
+        id: `imark-e-${idx}`,
+        source: t.src,
+        target: tgtId,
+        kind: t.kind,
+        jumpkind: t.jumpkind,
+        isBoundary: isStub,
+        transitionIdx: idx,
+        srcPc: t.src,
+        tgtPc: t.tgt,
+        label: instructionActionLabel(t),
+      },
+    });
+  });
+  cyFull = cytoscape({
+    container: document.getElementById('cy-imark-full'),
+    elements: [...nodes, ...edges],
+    style: imarkStyle({ compact: true }),
+    // c2.5 had bumped rankSep 22→36 to give canvas edge labels space.
+    // Reverted to original 22 since labels are html-overlay (positioned
+    // independently of dagre's rank-spacing).
+    layout: { name: 'dagre', rankDir: 'TB', nodeSep: 12, rankSep: 22, edgeSep: 4 },
+    wheelSensitivity: 0.2,
+    selectionType: 'single',
+  });
+  cyFull.on('tap', 'node', evt => {
+    const data = evt.target.data();
+    if (data.isStub) return;
+    const pc = data.id;
+    // A1 (idea A): shift-click in cyFull mirrors cyScoped's two-step
+    // shift-click range UX. Anchor is cross-graph: setting it on one
+    // graph applies the visual to the same pc-id node on the other.
+    const shiftKey = !!(evt.originalEvent && evt.originalEvent.shiftKey);
+    if (shiftKey) {
+      const anchorBlock = _imarkClickAnchor ? pcToBlock[_imarkClickAnchor] : null;
+      const clickBlock = pcToBlock[pc];
+      if (!_imarkClickAnchor || anchorBlock !== clickBlock) {
+        _imarkClickAnchor = pc;
+        if (cyScoped) cyScoped.elements('.shift-anchor').removeClass('shift-anchor');
+        cyFull.elements('.shift-anchor').removeClass('shift-anchor');
+        evt.target.addClass('shift-anchor');
+        const scopedNode = cyScoped ? cyScoped.getElementById(pc) : null;
+        if (scopedNode && scopedNode.length) scopedNode.addClass('shift-anchor');
+        return;
+      }
+      selectImarkRange(_imarkClickAnchor, pc, { source: 'full-shift' });
+      return;
+    }
+    selectImark(pc, { source: 'full' });
+  });
+  // LTS-refactor commit 2: edges clickable in the full graph too.
+  cyFull.on('tap', 'edge', evt => {
+    const idx = evt.target.data('transitionIdx');
+    selectImarkTransition(idx, { source: 'full' });
+  });
+  // c2.6 path C: HTML overlay sync. Each pan/zoom/render/layoutstop
+  // event repositions every label div to its edge midpoint in screen
+  // coords; collision pass nudges overlapping labels apart.
+  installLabelOverlay(cyFull, document.getElementById('overlay-full'), { compact: true });
+}
+
+// =====================================================================
+// LTS-refactor commit 2.6 path C: HTML overlay edge labels
+//
+// Why HTML instead of cytoscape canvas labels:
+//   - DOM bbox via getBoundingClientRect is exact at any zoom
+//   - Position fully arbitrary (not constrained to edge direction
+//     like cytoscape's text-margin-* / target-text-offset)
+//   - Iterative collision pass can resolve label-vs-label and
+//     label-vs-node overlaps that cytoscape style cannot.
+//   - Multi-line, font-family, background-pill all easier in CSS.
+//
+// Path A (elk.edgeLabels.inline:true) was silently ignored by ELK
+// Layered. Path B (target-side cytoscape labels) hit the scalar-
+// offset wall (single offset can't clear source AND target across
+// all edge geometries). Path C is the principled solution.
+//
+// Architecture:
+//   - One transparent overlay div per cy container (.label-overlay)
+//   - Per-edge child div .html-edge-label, positioned via transform
+//   - syncEdgeLabels() wires to cy events, computes screen coords
+//   - resolveLabelCollisions() iterates 5x to push labels out of
+//     each other and out of node bboxes
+// =====================================================================
+
+function installLabelOverlay(cy, overlayEl, { compact }) {
+  if (!cy || !overlayEl) return;
+  // Polish followup #25: rAF throttle on syncEdgeLabels.
+  // syncEdgeLabels runs on every cy 'render' event (which fires
+  // each frame during pan/zoom/layout). For tsm's 187 labels this
+  // is fine; for larger graphs (luaV_execute, future Lua-sized
+  // benchmarks with 1000+ transitions) the per-frame label sync
+  // gets expensive enough to drop frames.
+  // Throttle: collapse multiple sync requests in the same frame
+  // into one actual syncEdgeLabels run at the next animation
+  // frame. cy class-change → cy.scratch('_syncEdgeLabels')() still
+  // works for external callers (applySourceRangeHighlight /
+  // clearSourceRangeHighlight); the throttle defers the visual
+  // by one frame which is imperceptible.
+  let pending = false;
+  const sync = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      syncEdgeLabels(cy, overlayEl, { compact });
+    });
+  };
+  // B2: expose the throttled sync via cy.scratch so external callers
+  // (applySourceRangeHighlight / clearSourceRangeHighlight) can force
+  // an overlay re-sync after class changes. Cytoscape's class-change
+  // does NOT fire 'render' by default, so we need an explicit hook.
+  cy.scratch('_syncEdgeLabels', sync);
+  cy.on('pan zoom render layoutstop', sync);
+  // Initial render after layout settles. Cytoscape's layout is async;
+  // the layoutstop event fires after but render fires on each frame.
+  setTimeout(sync, 50);
+}
+
+function syncEdgeLabels(cy, overlayEl, { compact }) {
+  if (!cy || !overlayEl) return;
+  const z = cy.zoom();
+  const p = cy.pan();
+  // Track which edges still exist so orphan divs can be removed.
+  const live = new Set();
+  cy.edges().forEach(e => {
+    const text = e.data('label');
+    if (!text) return;
+    const id = e.id();
+    live.add(id);
+    let div = overlayEl.querySelector(`[data-edge="${cssEscape(id)}"]`);
+    if (!div) {
+      div = document.createElement('div');
+      div.className = 'html-edge-label' + (compact ? ' compact' : '');
+      div.dataset.edge = id;
+      // c2.7.6 (codex c2.7.4 follow-up #1): label is its own click
+      // target. transitionIdx in dataset so the click handler can
+      // call selectImarkTransition without re-deriving from edge.
+      div.dataset.transitionIdx = String(e.data('transitionIdx'));
+      div.addEventListener('click', evt => {
+        evt.stopPropagation();
+        const idx = parseInt(div.dataset.transitionIdx, 10);
+        if (!Number.isInteger(idx) || idx < 0) return;
+        selectImarkTransition(idx, { source: 'overlay-label' });
+      });
+      // CSS white-space: pre-line interprets \n as line break and
+      // wraps long lines at word boundaries up to max-width.
+      div.textContent = text;
+      overlayEl.appendChild(div);
+    } else if (div.textContent !== text) {
+      // Text changed (rare; happens when LTS data reloads).
+      div.textContent = text;
+      // Keep transitionIdx in sync if edge data drifted (rare).
+      div.dataset.transitionIdx = String(e.data('transitionIdx'));
+    }
+    // Class flags (kind / boundary / selected) so CSS handles
+    // appearance per category without per-div inline styles.
+    const kind = e.data('kind');
+    div.classList.toggle('kind-exit', kind === 'exit');
+    div.classList.toggle('kind-default', kind === 'default');
+    div.classList.toggle('kind-primitive', kind === 'primitive');
+    div.classList.toggle('boundary', !!e.data('isBoundary'));
+    div.classList.toggle('selected', e.selected());
+    // B2 (idea B): mirror cytoscape's .in-scope / .out-of-scope classes
+    // (set by applySourceRangeHighlight) onto the overlay div so CSS
+    // can fade out-of-scope labels in step with the cytoscape edge
+    // styles. Without this, the cytoscape edge fades but its label
+    // stays at full opacity — visually contradictory.
+    div.classList.toggle('in-scope', e.hasClass('in-scope'));
+    div.classList.toggle('out-of-scope', e.hasClass('out-of-scope'));
+    // Anchor at edge midpoint in screen coords. cytoscape's midpoint()
+    // returns model-space; convert via current zoom + pan.
+    const m = e.midpoint();
+    const x = m.x * z + p.x;
+    const y = m.y * z + p.y;
+    // Reset offset (collision pass will add nudges via dx/dy data attrs).
+    div.dataset.anchorX = String(x);
+    div.dataset.anchorY = String(y);
+    div.dataset.dx = '0';
+    div.dataset.dy = '0';
+    div.style.transform = `translate(${x}px,${y}px) translate(-50%,-50%)`;
+  });
+  // Remove orphan divs (edges that no longer exist or lost their label).
+  overlayEl.querySelectorAll('.html-edge-label').forEach(div => {
+    if (!live.has(div.dataset.edge)) div.remove();
+  });
+  // After all positions set, run collision-resolution pass so labels
+  // don't crash into nodes or each other.
+  resolveLabelCollisions(cy, overlayEl, z, p);
+}
+
+function resolveLabelCollisions(cy, overlayEl, zoom, pan) {
+  const labels = Array.from(overlayEl.querySelectorAll('.html-edge-label'));
+  // c2.6 fixup (codex post-impl [Medium]): early-exit only on zero
+  // labels. Previously `< 2` skipped the label-vs-node pass for
+  // single-label cases (within-block segments with only one outgoing
+  // transition), letting that lone label sit on its target node.
+  // The pairwise label-label loop naturally no-ops for one label.
+  if (labels.length === 0) return;
+  // Pre-compute node screen-space bboxes (label cannot occlude nodes).
+  const nodeBoxes = [];
+  cy.nodes().forEach(n => {
+    if (!n.visible()) return;
+    const bb = n.boundingBox({ includeLabels: false });
+    nodeBoxes.push({
+      x1: bb.x1 * zoom + pan.x,
+      y1: bb.y1 * zoom + pan.y,
+      x2: bb.x2 * zoom + pan.x,
+      y2: bb.y2 * zoom + pan.y,
+    });
+  });
+  // Iterative resolver: detect overlaps, push apart with damping.
+  // STEP slightly over 0.5 prevents stalling in oscillation cycles
+  // without overshooting too much. NODE_PUSH = 1.0 is hard — labels
+  // never sit on a node. Iterations tuned for tsm's densest clusters
+  // (compound-guard branches with adjacent fan-outs); convergence
+  // verified by post-pass overlap count via chrome-devtools.
+  const STEP = 0.6;
+  const NODE_PUSH = 1.0;
+  const ITERATIONS = 25;
+  for (let iter = 0; iter < ITERATIONS; iter++) {
+    // Refresh bboxes each iteration (translate changes affect rect).
+    const rects = labels.map(d => ({ d, r: d.getBoundingClientRect() }));
+    const overlayRect = overlayEl.getBoundingClientRect();
+    // Push labels out of nodes (relative to overlay-local coords).
+    for (const { d, r } of rects) {
+      const lx1 = r.left - overlayRect.left;
+      const ly1 = r.top - overlayRect.top;
+      const lx2 = r.right - overlayRect.left;
+      const ly2 = r.bottom - overlayRect.top;
+      for (const nb of nodeBoxes) {
+        const overlapX = Math.min(lx2, nb.x2) - Math.max(lx1, nb.x1);
+        const overlapY = Math.min(ly2, nb.y2) - Math.max(ly1, nb.y1);
+        if (overlapX > 0 && overlapY > 0) {
+          // Push along the smaller-overlap axis (cheaper escape).
+          if (overlapX < overlapY) {
+            const lcx = (lx1 + lx2) / 2;
+            const ncx = (nb.x1 + nb.x2) / 2;
+            const dir = lcx < ncx ? -1 : 1;
+            d.dataset.dx = String(parseFloat(d.dataset.dx) + dir * (overlapX + 1) * NODE_PUSH);
+          } else {
+            const lcy = (ly1 + ly2) / 2;
+            const ncy = (nb.y1 + nb.y2) / 2;
+            const dir = lcy < ncy ? -1 : 1;
+            d.dataset.dy = String(parseFloat(d.dataset.dy) + dir * (overlapY + 1) * NODE_PUSH);
+          }
+        }
+      }
+    }
+    // Push labels apart from each other (half each).
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        const a = rects[i], b = rects[j];
+        const ax1 = a.r.left, ay1 = a.r.top, ax2 = a.r.right, ay2 = a.r.bottom;
+        const bx1 = b.r.left, by1 = b.r.top, bx2 = b.r.right, by2 = b.r.bottom;
+        const overlapX = Math.min(ax2, bx2) - Math.max(ax1, bx1);
+        const overlapY = Math.min(ay2, by2) - Math.max(ay1, by1);
+        if (overlapX > 0 && overlapY > 0) {
+          if (overlapX < overlapY) {
+            const acx = (ax1 + ax2) / 2;
+            const bcx = (bx1 + bx2) / 2;
+            const dir = acx < bcx ? -1 : 1;
+            const push = (overlapX + 1) * STEP;
+            a.d.dataset.dx = String(parseFloat(a.d.dataset.dx) + dir * push);
+            b.d.dataset.dx = String(parseFloat(b.d.dataset.dx) - dir * push);
+          } else {
+            const acy = (ay1 + ay2) / 2;
+            const bcy = (by1 + by2) / 2;
+            const dir = acy < bcy ? -1 : 1;
+            const push = (overlapY + 1) * STEP;
+            a.d.dataset.dy = String(parseFloat(a.d.dataset.dy) + dir * push);
+            b.d.dataset.dy = String(parseFloat(b.d.dataset.dy) - dir * push);
+          }
+        }
+      }
+    }
+    // Apply accumulated nudges via transform.
+    for (const { d } of rects) {
+      const x = parseFloat(d.dataset.anchorX) + parseFloat(d.dataset.dx);
+      const y = parseFloat(d.dataset.anchorY) + parseFloat(d.dataset.dy);
+      d.style.transform = `translate(${x}px,${y}px) translate(-50%,-50%)`;
+    }
+  }
+}
+
+// CSS.escape polyfill — querySelector with attribute selector chokes on
+// edge IDs containing special characters (cytoscape allows '.', '#').
+function cssEscape(s) {
+  if (window.CSS && window.CSS.escape) return window.CSS.escape(s);
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, c => '\\' + c);
+}
+
+// =====================================================================
+// Mode toggle
+// =====================================================================
+
+function wireToggle() {
+  const btnBlock = document.getElementById('btn-block-guided');
+  const btnFull = document.getElementById('btn-full-imark');
+  const helper = document.getElementById('helper-text');
+  btnBlock.addEventListener('click', () => {
+    document.body.classList.remove('mode-full-imark');
+    document.body.classList.add('mode-block-guided');
+    btnBlock.classList.add('active');
+    btnFull.classList.remove('active');
+    helper.textContent = 'Click a block to drill into its instruction decomposition.';
+    // LTS-refactor commit 2.1 (fixup of codex c2 post-impl [Medium]):
+    // selectImarkTransition skips scoped-pane rebuild while full-imark
+    // mode is active (intentional — saves work when right pane is
+    // hidden). On switching back to block-guided mode, rebuild from
+    // selectedBlockAddr() so the right pane reflects the actually-
+    // selected block instead of stale content from before the user
+    // navigated through the full-imark graph.
+    const block = selectedBlockAddr();
+    if (block) {
+      rebuildScopedImarkGraph(block);
+      // Re-apply selection visuals so the freshly-built scoped graph
+      // mirrors the unified `selected` entity.
+      if (cyScoped && selected) {
+        if (selected.type === 'imark-node' && selected.pc) {
+          const node = cyScoped.getElementById(selected.pc);
+          if (node && node.length) node.select();
+        } else if (selected.type === 'imark-transition') {
+          const edge = cyScoped.getElementById(`imark-e-${selected.idx}`);
+          if (edge && edge.length) {
+            edge.select();
+            edge.connectedNodes().addClass('related');
+          }
+        }
+      }
+    }
+    // Re-fit graphs after layout settles.
+    setTimeout(() => { cyBlock && cyBlock.fit(undefined, 30); cyScoped && cyScoped.fit(undefined, 30); }, 50);
+  });
+  btnFull.addEventListener('click', () => {
+    document.body.classList.remove('mode-block-guided');
+    document.body.classList.add('mode-full-imark');
+    btnBlock.classList.remove('active');
+    btnFull.classList.add('active');
+    helper.textContent = 'Dense source LTS · pan/zoom/select transitions and control locations.';
+    setTimeout(() => { cyFull && cyFull.fit(undefined, 30); }, 50);
+  });
+}
+
+// =====================================================================
+// Selection (linked between graphs)
+// =====================================================================
+
+function wireSelections() {
+  cyBlock.on('tap', 'node', evt => {
+    const data = evt.target.data();
+    selectBlock(data.id, { source: 'block-graph' });
+  });
+  // c4: real block-LTS edges are now first-class clickable entities,
+  // each representing one composed-block transition. Quotient-fallback
+  // edges (data.count without transitionIdx) stay non-interactive
+  // since they aggregate multiple transitions and have no canonical
+  // single transition to select.
+  cyBlock.on('tap', 'edge', evt => {
+    const data = evt.target.data();
+    if (data.transitionIdx == null) return;  // legacy quotient edge
+    selectBlockTransition(data.transitionIdx, { source: 'block-graph' });
+  });
+}
+
+// Sophie's followup (2026-04-29 evening): drag-resize the detail
+// panel + left↔right pane divider via 6px handles at the
+// respective boundaries. Mousedown installs document-level
+// mousemove/mouseup listeners; mousemove updates the appropriate
+// CSS variable on <main>. Cytoscape doesn't auto-resize on
+// container resize (it uses cached viewport metrics), so we also
+// call cy.resize() on each cy after the drag ends.
+function wireDetailResize() {
+  const mainEl = document.querySelector('main');
+  if (!mainEl) return;
+  // Generic per-handle factory: each handle drags one boundary,
+  // updates one CSS variable. ondrag(newWidth) is the per-boundary
+  // mapping from cursor position to width value (in px).
+  const installHandle = (handleId, varName, ondrag) => {
+    const handle = document.getElementById(handleId);
+    if (!handle) return;
+    let dragging = false;
+    handle.addEventListener('mousedown', evt => {
+      dragging = true;
+      handle.classList.add('dragging');
+      document.body.style.cursor = 'ew-resize';
+      document.body.style.userSelect = 'none';
+      evt.preventDefault();
+    });
+    document.addEventListener('mousemove', evt => {
+      if (!dragging) return;
+      const newWidth = ondrag(evt);
+      if (newWidth != null) {
+        mainEl.style.setProperty(varName, newWidth + 'px');
+      }
+    });
+    document.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      // Cytoscape needs explicit resize() — its internal viewport
+      // cache otherwise stays at pre-drag dimensions and the graph
+      // renders clipped.
+      if (cyBlock) cyBlock.resize();
+      if (cyScoped) cyScoped.resize();
+      if (cyFull) cyFull.resize();
+    });
+  };
+
+  // Detail handle: drag between #right-pane and #detail-panel.
+  // detail-width = distance from cursor to right viewport edge.
+  // Clamp matches CSS min-width:200px / max-width:80vw on #detail-panel.
+  const detailMinWidth = 200;
+  const detailMaxWidth = () => Math.floor(window.innerWidth * 0.8);
+  installHandle('detail-resize-handle', '--detail-width', evt => {
+    let w = window.innerWidth - evt.clientX;
+    if (w < detailMinWidth) w = detailMinWidth;
+    if (w > detailMaxWidth()) w = detailMaxWidth();
+    return w;
+  });
+
+  // Left handle: drag between #left-pane and #right-pane.
+  // left-width = cursor's distance from left viewport edge.
+  // Clamp: min 200px (mirrors #left-pane min-width), max =
+  // viewport-width minus right-pane min (200) minus current
+  // detail-width minus the two ~6px handles' worth of slack.
+  const leftMinWidth = 200;
+  const leftMaxWidth = () => {
+    const detailW = parseInt(getComputedStyle(mainEl).getPropertyValue('--detail-width')) || 360;
+    return Math.max(
+      leftMinWidth,
+      window.innerWidth - 200 /* right min */ - detailW - 16 /* slack */
+    );
+  };
+  installHandle('left-resize-handle', '--left-width', evt => {
+    let w = evt.clientX;
+    if (w < leftMinWidth) w = leftMinWidth;
+    if (w > leftMaxWidth()) w = leftMaxWidth();
+    return w;
+  });
+}
+
+function selectBlock(addr, { source }) {
+  // LTS-refactor commit 1: write through the unified selected
+  // entity. selectBlock represents a 'block-node' selection
+  // (control location at block granularity); future callers
+  // selecting a specific block transition should call
+  // selectBlockTransition instead.
+  selected = { type: 'block-node', addr };
+  // B2: clear any source-range subgraph fade left over from a prior
+  // source-range selection — this transition is leaving idea B's mode
+  // and entering a single-block selection.
+  clearSourceRangeHighlight();
+  // A1: clear any pending imark-range anchor.
+  clearImarkRangeAnchor();
+  // Highlight on block graph.
+  if (cyBlock) {
+    cyBlock.elements().unselect();
+    cyBlock.elements('.related').removeClass('related');
+    cyBlock.elements('.active').removeClass('active');
+    const node = cyBlock.getElementById(addr);
+    if (node && node.length) {
+      node.select();
+      // Center if not initiating from the block graph itself (avoid jitter).
+      if (source !== 'block-graph') cyBlock.animate({ center: { eles: node }, duration: 200 });
+    }
+  }
+  // Rebuild scoped imark graph.
+  rebuildScopedImarkGraph(addr);
+  // Full-imark pane stays imark-only per sophie's directive: clear
+  // any lingering highlights when the selected block changes.
+  if (cyFull) {
+    cyFull.elements('.related').removeClass('related');
+    cyFull.elements('.active').removeClass('active');
+  }
+  renderDetail();
+}
+
+function selectImark(pc, { source }) {
+  // Capture prevBlock BEFORE reassignment so we can detect when the
+  // newly-selected imark is in a different block than what the
+  // scoped pane currently shows. (Codex's catch-up [Medium] finding:
+  // 'rebuild branch is effectively unreachable' since we used to set
+  // selectedBlock = block first, then compare block === selectedBlock
+  // which is trivially true.) — preserved through the LTS-refactor
+  // commit 1 selected-entity transition by reading prev via the
+  // selectedBlockAddr() accessor.
+  const prevBlock = selectedBlockAddr();
+  const block = pcToBlock[pc] || null;
+  // LTS-refactor commit 1: write through the unified selected
+  // entity. selectImark represents an 'imark-node' selection
+  // (control location at imark granularity).
+  selected = { type: 'imark-node', pc };
+  // B2: leaving source-range mode (or idle) → single-imark selection.
+  clearSourceRangeHighlight();
+  // A1: clear any pending imark-range anchor — single-imark selection
+  // resets the anchor since the user is now committing to one imark.
+  clearImarkRangeAnchor();
+  if (cyFull) {
+    // Full-imark pane is "imark-only" per sophie's directive — no
+    // block-context highlight on the main graph. Single :selected
+    // on the clicked imark, nothing else decorated.
+    cyFull.elements('.related').removeClass('related');
+    cyFull.elements('.active').removeClass('active');
+    const node = cyFull.getElementById(pc);
+    if (node && node.length) {
+      cyFull.elements().unselect();
+      node.select();
+      if (source !== 'full') cyFull.animate({ center: { eles: node }, duration: 200 });
+    }
+  }
+  if (cyScoped && block === prevBlock) {
+    // Scoped pane already showing the right block — just adjust selection.
+    cyScoped.elements().unselect();
+    // Polish #27.1 (codex polish [Medium]): clear stale .related state
+    // in the same-block branch too. Otherwise prior selectImarkTransition
+    // endpoint marks linger and mix with #27's same-source-line sibling
+    // marks added at the bottom of this function.
+    cyScoped.elements('.related').removeClass('related');
+    cyScoped.elements('.active').removeClass('active');
+    const node = cyScoped.getElementById(pc);
+    if (node && node.length) node.select();
+  } else if (block) {
+    // Different block (or no scoped pane yet) — rebuild scoped graph.
+    rebuildScopedImarkGraph(block);
+    if (cyScoped) {
+      const node = cyScoped.getElementById(pc);
+      if (node && node.length) node.select();
+    }
+  }
+  if (cyBlock && block) {
+    cyBlock.elements().unselect();
+    // Polish #27.1 (codex polish [Low]): clear .related state on cyBlock
+    // too so prior block-transition endpoint marks don't linger when
+    // navigating to an imark selection.
+    cyBlock.elements('.related').removeClass('related');
+    cyBlock.getElementById(block).select();
+  }
+  // Polish followup #27: multi-pin highlight for siblings on same
+  // source line. When the selected imark shares a source line with
+  // other imarks (compiler emits N machine instructions per C
+  // statement), mark the siblings .related so the user sees the
+  // group at a glance instead of just the single chosen imark. The
+  // imark itself is :selected (accent fill); siblings get the
+  // existing .related (accent tint, weaker than :selected). codex
+  // c2.7 design called for this; v0 deferred for lack of multi-pin
+  // primitive — this commit adds it now that .related is the
+  // established multi-marking class.
+  const sourceIdx = _ensureSourceIndex();
+  const loc = sourceIdx.pcToLoc[pc];
+  if (loc) {
+    const key = loc.source_file + '\u0001' + loc.source_line;
+    const siblingPcs = (sourceIdx.fileLineToPcs[key] || []).filter(p => p !== pc);
+    if (cyFull) {
+      for (const sp of siblingPcs) {
+        const sib = cyFull.getElementById(sp);
+        if (sib && sib.length) sib.addClass('related');
+      }
+    }
+    if (cyScoped) {
+      for (const sp of siblingPcs) {
+        const sib = cyScoped.getElementById(sp);
+        if (sib && sib.length) sib.addClass('related');
+      }
+    }
+  }
+  renderDetail();
+}
+
+// LTS-refactor commit 2: central transition-selection helper.
+// Single source-of-truth for constructing imark-transition selections.
+// Edge tap handlers and (future c3) sidebar rows both call THIS — they
+// must NEVER hand-construct {idx, pc} pairs (codex c1 foot-gun).
+//
+// `pc` is derived from imarkTransitionByIdx(i).src, never from edge
+// data. Edge data carries only the stable transition index.
+function selectImarkTransition(idx, { source } = { source: 'manual' }) {
+  const i = Number(idx);
+  if (!Number.isInteger(i) || i < 0) return;
+  const t = imarkTransitionByIdx(i);
+  if (!t) return;
+  const pc = t.src;
+  const block = pcToBlock[pc] || null;
+  const prevBlock = selectedBlockAddr();
+  selected = { type: 'imark-transition', idx: i, pc };
+  // B2: leaving source-range mode (or idle) → single-transition
+  // selection.
+  clearSourceRangeHighlight();
+  // A1: clear any pending imark-range anchor.
+  clearImarkRangeAnchor();
+
+  // cyFull: clear, then select the matching edge. The cy-edge ID
+  // scheme `imark-e-${idx}` is shared between cyScoped and cyFull; the
+  // edge with this ID exists in cyFull (always — cyFull contains all
+  // imark transitions) and in cyScoped iff its src lives in the
+  // currently-shown block.
+  if (cyFull) {
+    cyFull.elements().unselect();
+    cyFull.elements('.related').removeClass('related');
+    cyFull.elements('.active').removeClass('active');
+    const edge = cyFull.getElementById(`imark-e-${i}`);
+    if (edge && edge.length) {
+      edge.select();
+      // .related on the edge's connected nodes (subtle source/target
+      // hint, per codex c2 review). Avoids overloading the selected
+      // accent color on the nodes themselves.
+      edge.connectedNodes().addClass('related');
+      if (source !== 'full') cyFull.animate({ center: { eles: edge }, duration: 200 });
+    }
+  }
+
+  // cyScoped: only meaningful when scoped pane is showing the
+  // containing block. If a different block is shown, rebuild — but
+  // only when the right pane is visible (mode-block-guided). codex c2:
+  // 'do not rebuild the scoped pane unless you need it visible/current.'
+  const scopedVisible = !document.body.classList.contains('mode-full-imark');
+  if (scopedVisible) {
+    if (cyScoped && block === prevBlock) {
+      cyScoped.elements().unselect();
+      cyScoped.elements('.related').removeClass('related');
+      const edge = cyScoped.getElementById(`imark-e-${i}`);
+      if (edge && edge.length) {
+        edge.select();
+        edge.connectedNodes().addClass('related');
+      }
+    } else if (block) {
+      rebuildScopedImarkGraph(block);
+      if (cyScoped) {
+        const edge = cyScoped.getElementById(`imark-e-${i}`);
+        if (edge && edge.length) {
+          edge.select();
+          edge.connectedNodes().addClass('related');
+        }
+      }
+    }
+  }
+
+  // cyBlock: highlight containing block (transition selection still
+  // implies *some* control location, and that location lives in a block).
+  if (cyBlock && block) {
+    cyBlock.elements().unselect();
+    const node = cyBlock.getElementById(block);
+    if (node && node.length) node.select();
+  }
+
+  renderDetail();
+}
+
+// Block-LTS counterpart. Symmetric API for c4 when block-graph edges
+// become real composed-block transitions. Currently only invoked
+// programmatically (cyBlock edges are NOT wired in c2 — they're still
+// xN quotient aggregates with confusing semantics).
+function selectBlockTransition(idx, { source } = { source: 'manual' }) {
+  const i = Number(idx);
+  if (!Number.isInteger(i) || i < 0) return;
+  const t = blockTransitionByIdx(i);
+  if (!t) return;
+  const addr = t.src;
+  selected = { type: 'block-transition', idx: i, addr };
+  // B2: leaving source-range mode (or idle).
+  clearSourceRangeHighlight();
+  // A1: clear any pending imark-range anchor.
+  clearImarkRangeAnchor();
+  // c4.1 (codex c4 [Medium]): select the actual block-LTS edge in
+  // cyBlock, not the source block node. The detail panel is
+  // transition-specific; the graph visual must match. Mark connected
+  // nodes (.related) so the user sees src/tgt context. Falls back
+  // to source-node selection only when the edge is absent (e.g.
+  // skipped ret/null-target transition selected programmatically,
+  // or pre-c4 fallback to quotient-edge mode).
+  if (cyBlock) {
+    cyBlock.elements().unselect();
+    cyBlock.elements('.related').removeClass('related');
+    const edge = cyBlock.getElementById(`block-e-${i}`);
+    if (edge && edge.length) {
+      edge.select();
+      edge.connectedNodes().addClass('related');
+    } else {
+      const node = cyBlock.getElementById(addr);
+      if (node && node.length) node.select();
+    }
+  }
+  renderDetail();
+}
+
+// B2 (idea B): apply the source-range subgraph highlight to all
+// cytoscape graphs.
+//
+// imark graphs (cyScoped, cyFull):
+//   - node.in-scope  for nodes whose pc is in selected.pcs
+//   - node.out-of-scope for the rest
+//   - edge.in-scope  for edges whose .src pc is in selected.pcs
+//                    (transition's src is the imark control location;
+//                    the edge represents the action emitted FROM that
+//                    location)
+//   - edge.out-of-scope for the rest
+// block graph (cyBlock):
+//   - node.in-scope for blocks containing ANY pc in selected.pcs
+//   - node.out-of-scope for blocks with no overlap
+//   - edges left alone (cyBlock edges are quotient ×N aggregates,
+//     not LTS transitions — c4 will reshape them, then in-scope on
+//     edges becomes meaningful here too)
+//
+// Triggers an overlay-label re-sync via cy.scratch('_syncEdgeLabels')
+// since cytoscape class-change does not fire its 'render' event.
+function applySourceRangeHighlight(sel) {
+  if (!sel || sel.type !== 'source-range') return;
+  const pcsInRange = new Set(sel.pcs);
+
+  const markImarkCy = (cy) => {
+    if (!cy) return;
+    cy.elements().removeClass('in-scope out-of-scope');
+    cy.nodes().forEach(node => {
+      if (pcsInRange.has(node.id())) node.addClass('in-scope');
+      else node.addClass('out-of-scope');
+    });
+    cy.edges().forEach(edge => {
+      const transitionIdx = edge.data('transitionIdx');
+      const t = (transitionIdx != null) ? imarkTransitionByIdx(transitionIdx) : null;
+      if (t && pcsInRange.has(t.src)) edge.addClass('in-scope');
+      else edge.addClass('out-of-scope');
+    });
+    const sync = cy.scratch('_syncEdgeLabels');
+    if (sync) sync();
+  };
+  markImarkCy(cyScoped);
+  markImarkCy(cyFull);
+
+  if (cyBlock) {
+    cyBlock.elements().removeClass('in-scope out-of-scope');
+    const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+    cyBlock.nodes().forEach(node => {
+      const blockAddr = node.id();
+      const bb = fn ? (fn.basic_blocks || []).find(b => b.addr === blockAddr) : null;
+      if (!bb) return;
+      const blockPcs = new Set(bb.instruction_pcs || []);
+      let hasMatch = false;
+      for (const pc of pcsInRange) {
+        if (blockPcs.has(pc)) { hasMatch = true; break; }
+      }
+      if (hasMatch) node.addClass('in-scope');
+      else node.addClass('out-of-scope');
+    });
+  }
+}
+
+// Clear in-scope/out-of-scope classes on all cytoscape graphs +
+// re-sync overlay labels so they revert to default styling. Called
+// from non-source-range selection mutators (selectBlock, selectImark,
+// selectImarkTransition, selectBlockTransition) so the subgraph
+// highlight evaporates when the user navigates away from a source-
+// range selection.
+function clearSourceRangeHighlight() {
+  if (cyFull) {
+    cyFull.elements().removeClass('in-scope out-of-scope');
+    const sync = cyFull.scratch('_syncEdgeLabels');
+    if (sync) sync();
+  }
+  if (cyScoped) {
+    cyScoped.elements().removeClass('in-scope out-of-scope');
+    const sync = cyScoped.scratch('_syncEdgeLabels');
+    if (sync) sync();
+  }
+  if (cyBlock) {
+    cyBlock.elements().removeClass('in-scope out-of-scope');
+  }
+}
+
+// A2 (idea A): classify a set of program-counter values that form an
+// imark-range selection.
+//
+// Returns { kind, blocks, reason } where:
+//   kind:
+//     'empty'           — no pcs.
+//     'unclassified'    — pcs without block info; cannot judge.
+//     'linear'          — single block, contiguous slice in
+//                         instruction_pcs, AND every imark in the
+//                         slice has ≤1 outgoing LTS transition.
+//     'disconnected'    — single block, but the pcs are NOT contiguous
+//                         in instruction_pcs (gaps exist).
+//     'branching'       — range spans multiple blocks (cross-block,
+//                         not currently reachable via the v0
+//                         selectImarkRange tap UX, but classifier
+//                         handles it for future cross-block selection
+//                         paths) OR same-block range contains at
+//                         least one imark with >1 outgoing LTS
+//                         transition. A2.1 (codex A2 [Medium]):
+//                         counts ALL outgoing transitions, not only
+//                         those whose target is in-range — a Jcc /
+//                         REP / multi-edge imark is structurally
+//                         branching at the LTS level even when both
+//                         branches leave the selected pcs.
+//   blocks: array of block addrs the range touches.
+//   reason: short prose for diagnostic UI.
+//
+// Reusable: this is the shape codex flagged as A's "structural truth"
+// vs LTS-linearity distinction. Same-block contiguity does NOT imply
+// linear: a Jcc / REP / call imark inside the slice might branch.
+// =====================================================================
+// Voogd-style compose_subs over the architectural-state SMT-LIB
+// fragments that pyvex emits in t.sub. Substitution-only — no Z3
+// simplification (yet); composed expressions are correct algebraically
+// but pre-simplify (e.g. nested (bvadd C1 (bvadd C2 rsp)) instead of
+// the collapsed (bvadd (C1+C2) rsp)).
+//
+// Format note: t.sub is a {var → S-expression-string} map over
+// architectural state vars (rsp, rip, rbp, rax, rflags_*, mem, ...).
+// pyvex emits SMT-LIB-flavored S-expressions like
+//   "(bvadd #xfffffffffffffff8 rsp)"
+//   "(store_le_8 mem (bvadd #xfffffffffffffff8 rsp) rbp)"
+// The substituter parses to a nested list-AST, walks leaf atoms, and
+// replaces atoms that match keys in the env (the previous transition's
+// sub). Opcodes / hex literals / unmodified vars pass through.
+//
+// composeSubs(s1, s2) returns the sub equivalent to executing s1 then
+// s2, treated as a single relational transformer. Identity:
+//   (s1 ; s2)[v] = if v ∈ s2 then s1(s2[v])
+//                  else if v ∈ s1 then s1[v]
+//                  else v
+// (where s1(expr) means: replace every free var in expr by its s1
+// mapping if present; pass through otherwise.)
+// =====================================================================
+function _smtTokenize(s) {
+  const toks = []; let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '(' || c === ')') { toks.push(c); i++; }
+    else if (c === ' ' || c === '\t' || c === '\n') i++;
+    else {
+      let j = i;
+      while (j < s.length && s[j] !== '(' && s[j] !== ')'
+             && s[j] !== ' ' && s[j] !== '\t' && s[j] !== '\n') j++;
+      toks.push(s.slice(i, j)); i = j;
+    }
+  }
+  return toks;
+}
+function _smtParse(toks) {
+  let i = 0;
+  function read() {
+    if (toks[i] === '(') {
+      i++;
+      const list = [];
+      while (toks[i] !== ')') list.push(read());
+      i++;
+      return list;
+    }
+    return toks[i++];
+  }
+  return read();
+}
+function _smtEmit(ast) {
+  return typeof ast === 'string' ? ast : '(' + ast.map(_smtEmit).join(' ') + ')';
+}
+function _smtApplyEnv(ast, env) {
+  if (typeof ast === 'string') return env[ast] !== undefined ? env[ast] : ast;
+  return ast.map(x => _smtApplyEnv(x, env));
+}
+function composeSubs(s1, s2) {
+  const env = {};
+  for (const v in s1) env[v] = _smtParse(_smtTokenize(s1[v]));
+  const out = {};
+  for (const v in s2) {
+    out[v] = _smtEmit(_smtApplyEnv(_smtParse(_smtTokenize(s2[v])), env));
+  }
+  for (const v in s1) if (!(v in s2)) out[v] = s1[v];
+  return out;
+}
+// Compose along a chain of transitions in execution order. Each
+// transition is the raw lts.transitions[i] object (we read .sub).
+function composeChain(transitions) {
+  if (!transitions || transitions.length === 0) return {};
+  let result = transitions[0].sub || {};
+  for (let i = 1; i < transitions.length; i++) {
+    result = composeSubs(result, transitions[i].sub || {});
+  }
+  return result;
+}
+// Compose a guard along a chain: g1 ∧ s1(g2) ∧ (s1;s2)(g3) ∧ ...
+// where each subsequent guard is substituted by the cumulative sub.
+// 'true' guards are dropped from the conjunction.
+function composeChainGuard(transitions) {
+  if (!transitions || transitions.length === 0) return 'true';
+  const conjuncts = [];
+  let cumSub = {};
+  for (let i = 0; i < transitions.length; i++) {
+    const t = transitions[i];
+    const g = t.guard;
+    if (g && g !== 'true') {
+      // Substitute cumulative sub into this guard.
+      const env = {};
+      for (const v in cumSub) env[v] = _smtParse(_smtTokenize(cumSub[v]));
+      conjuncts.push(_smtEmit(_smtApplyEnv(_smtParse(_smtTokenize(g)), env)));
+    }
+    cumSub = composeSubs(cumSub, t.sub || {});
+  }
+  if (conjuncts.length === 0) return 'true';
+  if (conjuncts.length === 1) return conjuncts[0];
+  return '(and ' + conjuncts.join(' ') + ')';
+}
+
+function classifyImarkRange(pcs) {
+  if (!pcs || pcs.length === 0) {
+    return { kind: 'empty', blocks: [], reason: 'no program-counter values in range' };
+  }
+  const blockSet = new Set();
+  for (const pc of pcs) {
+    const b = pcToBlock[pc];
+    if (b) blockSet.add(b);
+  }
+  if (blockSet.size === 0) {
+    return { kind: 'unclassified', blocks: [], reason: 'no block info for any pc in range' };
+  }
+  if (blockSet.size > 1) {
+    return {
+      kind: 'branching',
+      blocks: Array.from(blockSet),
+      reason: `range spans ${blockSet.size} blocks — cross-block selection`,
+    };
+  }
+  const blockAddr = Array.from(blockSet)[0];
+  const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+  const bb = fn ? (fn.basic_blocks || []).find(b => b.addr === blockAddr) : null;
+  if (!bb) {
+    return { kind: 'unclassified', blocks: [blockAddr], reason: 'block not found in basic_blocks' };
+  }
+  const pcSet = new Set(pcs);
+  const blockPcs = bb.instruction_pcs;
+  const indicesInBlock = pcs
+    .map(p => blockPcs.indexOf(p))
+    .filter(i => i >= 0)
+    .sort((a, b) => a - b);
+  if (indicesInBlock.length === 0) {
+    return { kind: 'unclassified', blocks: [blockAddr], reason: 'pcs not present in block.instruction_pcs' };
+  }
+  const lo = indicesInBlock[0];
+  const hi = indicesInBlock[indicesInBlock.length - 1];
+  for (let i = lo; i <= hi; i++) {
+    if (!pcSet.has(blockPcs[i])) {
+      return {
+        kind: 'disconnected',
+        blocks: [blockAddr],
+        reason: `gap in instruction_pcs slice — ${blockPcs[i]} between selected pcs`,
+      };
+    }
+  }
+  // All pcs are contiguous in block.instruction_pcs. Check for
+  // branching: any imark in the range with >1 outgoing LTS transition
+  // (regardless of target). A2.1 (codex A2 [Medium]): the previous
+  // version only counted in-range outgoing transitions, which under-
+  // detected the common cmp/jne case where the conditional emits two
+  // outgoing transitions both targeting OUTSIDE the slice (taken /
+  // not-taken go to other blocks). Counting ALL outgoing transitions
+  // captures the structural-LTS-branching truth — a Jcc / REP / call
+  // imark in the range IS branching even when both branches leave the
+  // selected pcs.
+  for (const pc of pcs) {
+    let outgoing = 0;
+    for (const t of (lts.transitions || [])) {
+      if (t.src === pc) outgoing++;
+      if (outgoing > 1) break;
+    }
+    if (outgoing > 1) {
+      return {
+        kind: 'branching',
+        blocks: [blockAddr],
+        reason: `${pc} has >1 outgoing LTS transition (Jcc / REP / multi-edge imark)`,
+      };
+    }
+  }
+  return {
+    kind: 'linear',
+    blocks: [blockAddr],
+    reason: 'contiguous slice + every imark has ≤1 outgoing LTS transition',
+  };
+}
+
+// A1 (idea A): clear .shift-anchor visual marks across both imark
+// graphs + reset the module anchor. Called from selection mutators
+// that leave imark-range mode (selectBlock / selectImark /
+// selectImarkTransition / selectSourceRange / selectImarkRange
+// itself once range is formed). Symmetric to clearSourceRangeHighlight.
+function clearImarkRangeAnchor() {
+  _imarkClickAnchor = null;
+  if (cyFull) cyFull.elements('.shift-anchor').removeClass('shift-anchor');
+  if (cyScoped) cyScoped.elements('.shift-anchor').removeClass('shift-anchor');
+}
+
+// A1 (idea A): imark-range selection mutator. Two shift-clicks on
+// imark nodes (cyScoped or cyFull) call this with the anchor pc and
+// the second-click pc. v0 enforces same-block: the range is
+// `bb.instruction_pcs.slice(min(startIdx,endIdx), max+1)` for the
+// shared block. Cross-block ranges would need path-finding through
+// LTS transitions and are deferred (sophie's example was within-
+// block, and the basic_blocks API gives us a clean slice contract).
+//
+// `transitionIdxs` carries every transition whose src is in the
+// range — used by A2's detail panel + classifier.
+//
+// A2: rangeKind is now computed via classifyImarkRange(pcs). Same-
+// block contiguity does NOT imply LTS-linearity (Jcc / REP / call
+// imarks within a slice might branch); the classifier returns
+// 'linear' / 'branching' / 'disconnected' / 'unclassified' / 'empty'.
+function selectImarkRange(startPc, endPc, { source } = { source: 'manual' }) {
+  const startBlock = pcToBlock[startPc];
+  const endBlock = pcToBlock[endPc];
+  if (!startBlock || !endBlock) return;
+  if (startBlock !== endBlock) {
+    // v0 limit: cross-block ranges not supported. Caller is expected
+    // to either re-anchor in the new block or fall back to source-
+    // range B if the user wants cross-block selection (idea B handles
+    // multi-block by source-line).
+    return;
+  }
+  const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+  const bb = fn ? (fn.basic_blocks || []).find(b => b.addr === startBlock) : null;
+  if (!bb) return;
+  const startIdx = bb.instruction_pcs.indexOf(startPc);
+  const endIdx = bb.instruction_pcs.indexOf(endPc);
+  if (startIdx < 0 || endIdx < 0) return;
+  const lo = Math.min(startIdx, endIdx);
+  const hi = Math.max(startIdx, endIdx);
+  const pcs = bb.instruction_pcs.slice(lo, hi + 1);
+  const pcsSet = new Set(pcs);
+  const transitionIdxs = [];
+  (lts.transitions || []).forEach((t, i) => {
+    if (pcsSet.has(t.src)) transitionIdxs.push(i);
+  });
+  // A2: classify the range. classifyImarkRange returns the proper
+  // rangeKind based on cross-block coverage + intra-range branching
+  // (Jcc / REP / call imarks); same-block contiguity alone is not
+  // enough to claim 'linear'. Caller stores the full classification
+  // (kind + blocks + reason) on the selection so the detail panel
+  // can render diagnostics without re-classifying.
+  const classification = classifyImarkRange(pcs);
+  selected = {
+    type: 'imark-range',
+    pcs,
+    transitionIdxs,
+    rangeKind: classification.kind,
+    rangeBlocks: classification.blocks,
+    rangeClassReason: classification.reason,
+  };
+  // Leaving any prior mode: clear cytoscape selections + source-
+  // range fade + anchor visual.
+  clearSourceRangeHighlight();
+  if (cyFull) {
+    cyFull.elements().unselect();
+    cyFull.elements('.related').removeClass('related');
+    cyFull.elements('.active').removeClass('active');
+  }
+  if (cyScoped) {
+    cyScoped.elements().unselect();
+    cyScoped.elements('.related').removeClass('related');
+    cyScoped.elements('.active').removeClass('active');
+  }
+  if (cyBlock) {
+    cyBlock.elements().unselect();
+    cyBlock.elements('.related').removeClass('related');
+  }
+  // Anchor consumed by this range — clear it (and the visual marker).
+  clearImarkRangeAnchor();
+  renderDetail();
+}
+
+// B1 (idea B): source-range selection mutator. Shift-click in any
+// rendered source window calls this with the anchor + click line
+// numbers in a given source_file. The mutator collects all instruction
+// program-counter values whose source_line falls in [startLine,
+// endLine] for that file (FILE-scoped, not block-scoped — sophie's
+// idea B intent: "select source lines, see ALL imarks emitted from
+// those lines"), then sets the unified `selected` state to the
+// source-range variant and re-renders the detail.
+//
+// B2: also calls applySourceRangeHighlight after setting selected so
+// the cytoscape subgraph fade applies in step with the detail panel.
+function selectSourceRange(source_file, startLine, endLine, { source } = { source: 'manual' }) {
+  if (!source_file || !Number.isInteger(startLine) || !Number.isInteger(endLine)) return;
+  if (endLine < startLine) return;
+  const idx = _ensureSourceIndex();
+  // File-scoped pcs: walk fileLineToPcs by line. Single instruction
+  // can map to one source line only (DWARF), so no de-duplication
+  // needed across lines; within a single line the index already
+  // dedupes per insertion.
+  const pcs = [];
+  for (let line = startLine; line <= endLine; line++) {
+    const key = source_file + '\u0001' + line;
+    const linePcs = idx.fileLineToPcs[key];
+    if (linePcs && linePcs.length) {
+      for (const pc of linePcs) pcs.push(pc);
+    }
+  }
+  selected = {
+    type: 'source-range',
+    source_file,
+    startLine,
+    endLine,
+    pcs,
+  };
+  // Clear cytoscape selections (range selection isn't a single-node
+  // selection on any graph) and stale .related/.active class state.
+  // B2 then layers on the .in-scope/.out-of-scope subgraph fade.
+  if (cyFull) {
+    cyFull.elements().unselect();
+    cyFull.elements('.related').removeClass('related');
+    cyFull.elements('.active').removeClass('active');
+  }
+  if (cyScoped) {
+    cyScoped.elements().unselect();
+    cyScoped.elements('.related').removeClass('related');
+    cyScoped.elements('.active').removeClass('active');
+  }
+  if (cyBlock) {
+    cyBlock.elements().unselect();
+    cyBlock.elements('.related').removeClass('related');
+  }
+  // A1.1 (codex A1 [Medium]): clear any pending imark-range anchor.
+  // selectSourceRange entering source-range mode means the user is
+  // committing to a different selection mode; a stale .shift-anchor
+  // in cyScoped / cyFull would be confusing.
+  clearImarkRangeAnchor();
+  // B2: subgraph fade — apply BEFORE renderDetail so the html
+  // overlay sync inside renderDetail (if it triggers any) sees
+  // the in-scope/out-of-scope classes already in place.
+  applySourceRangeHighlight(selected);
+  renderDetail();
+}
+
+// =====================================================================
+// Detail panel
+// =====================================================================
+
+// LTS-refactor (selection-type formalization, pre-B):
+// renderDetail now reads from the unified `selected` state directly
+// instead of taking a redundant `{ kind, addr, pc, block, idx }`
+// parameter. Each call site that mutates `selected` simply calls
+// `renderDetail()` afterward — the dispatch is a `switch (selected.type)`
+// on the source-of-truth selection. New variants (`source-range` for
+// idea B, `imark-range` for idea A) currently fall to the placeholder
+// branch and will get dedicated rendering as the commits land.
+function renderDetail() {
+  const el = document.getElementById('detail-content');
+  if (!selected) {
+    el.innerHTML = `<h2>Detail</h2><p class="placeholder">Select a block or imark.</p>`;
+    return;
+  }
+  if (selected.type === 'block-node') {
+    const addr = selected.addr;
+    const fn = lts.function_index[0];
+    const bb = (fn.basic_blocks || []).find(b => b.addr === addr);
+    if (!bb) {
+      el.innerHTML = `<h2>Block</h2><p class="placeholder">No metadata for ${escapeHtml(addr)}.</p>`;
+      return;
+    }
+    const transitionsFromHere = lts.transitions.filter(t => bb.instruction_pcs.includes(t.src));
+    // Block-level ASM listing: each instruction in the block as a
+    // clickable disassembly line. Tufte: direct labels, monospace
+    // body, accent-colored mnemonic. Click to drill into the imark
+    // detail (single-select per the v0 selection rule).
+    const asmLinesHtml = bb.instruction_pcs.map(p => {
+      const insn = pcToInsn[p];
+      // c2.7.3: per-row source column. Always render the file:line
+      // ref when available — no suppression of consecutive same-line
+      // (codex c2.7 design call: repetition is information, signals
+      // a single C statement compiled to multiple machine instructions).
+      const loc = sourceLocForInstruction(p);
+      const srcHtml = loc
+        ? `<span class="asm-listing-src">` +
+            `<span class="file">${escapeHtml(loc.source_file_raw)}</span>` +
+            `<span class="line">${loc.source_line}</span>` +
+          `</span>`
+        : '';
+      const rowClass = loc ? 'asm-listing-line with-src' : 'asm-listing-line';
+      if (insn) {
+        return `<div class="${rowClass}" data-pc="${escapeHtml(p)}">` +
+               `<span class="asm-listing-pc">${escapeHtml(p)}</span>` +
+               `<span class="asm-listing-mnem">${escapeHtml(insn.mnemonic)}</span>` +
+               `<span class="asm-listing-op">${escapeHtml(insn.op_str)}</span>` +
+               srcHtml +
+               `</div>`;
+      }
+      // Fallback for LTS predating I.2.6b: PC only.
+      return `<div class="${rowClass}" data-pc="${escapeHtml(p)}">` +
+             `<span class="asm-listing-pc">${escapeHtml(p)}</span>` +
+             `<span class="asm-listing-mnem placeholder">(no asm metadata)</span>` +
+             srcHtml +
+             `</div>`;
+    }).join('');
+    // Block-level transitions from the legacy block-granular LTS.
+    // These ARE the composed-imark relational transformers — Voogd's
+    // compose_subs is exactly what the block-granular extractor
+    // computes during its block-scope symbolic execution. I.3 will
+    // formally prove the equivalence; for the viewer we read the
+    // composed sub directly. A3 (idea A): rendering extracted as
+    // renderBlockComposedEffects so imark-range detail (when range
+    // exactly equals bb.instruction_pcs) reuses the same shape.
+    const blockTransitions = blockToBlockTransitions[bb.addr] || [];
+    const blockTransitionsSection = renderBlockComposedEffects(bb.addr);
+    // c3: block detail also gets a transition-index over all imark
+    // transitions whose src is in this block. Tag each with _idx for
+    // renderTransitionIndex's contract. Lets the user see the flat
+    // transition-roster of the block at a glance without drilling into
+    // each imark.
+    const blockImarkTransitions = [];
+    (lts.transitions || []).forEach((t, i) => {
+      if (bb.instruction_pcs.includes(t.src)) {
+        blockImarkTransitions.push(Object.assign({}, t, { _idx: i }));
+      }
+    });
+    el.innerHTML = `
+      <section class="detail">
+        <h2>Block</h2>
+        <div class="row"><span class="k">addr</span><span class="v">${escapeHtml(bb.addr)}</span></div>
+        <div class="row"><span class="k">size</span><span class="v">${bb.size} bytes</span></div>
+        <div class="row"><span class="k">insns</span><span class="v">${bb.instruction_pcs.length}</span></div>
+        <div class="row"><span class="k">instruction transitions</span><span class="v">${transitionsFromHere.length}</span></div>
+        <div class="row"><span class="k">block transitions</span><span class="v">${blockTransitions.length || '<i>n/a</i>'}</span></div>
+        <div class="row"><span class="k">entry?</span><span class="v">${bb.addr === entryAddr ? 'yes (function entry)' : 'no'}</span></div>
+      </section>
+      <section class="detail">
+        <h2>Disassembly</h2>
+        <div class="asm-listing">${asmLinesHtml}</div>
+      </section>
+      ${renderSourceWindowHtml(sourceWindowForBlock(bb.addr, 2, 2))}
+      <section class="detail">
+        <h2>Instruction transitions · ${blockImarkTransitions.length} from instructions in block</h2>
+        ${renderTransitionIndex(blockImarkTransitions)}
+      </section>
+      ${blockTransitionsSection}
+    `;
+    // Wire ASM listing click to drill into a specific imark.
+    el.querySelectorAll('.asm-listing-line').forEach(node => {
+      node.addEventListener('click', () => {
+        const p = node.getAttribute('data-pc');
+        if (p) selectImark(p, { source: 'detail-list' });
+      });
+    });
+    // c2.7.4: source-window line click → select first imark on that
+    // source line. Sibling imarks on the same line get visual
+    // related-highlight via existing selection visuals (the chosen
+    // imark becomes selected; others stay un-selected but visible).
+    wireSourceWindowClicks(el);
+    // c3: wire the new "Imark transitions" index rows in block detail.
+    wireTransitionIndexClicks(el);
+  } else if (selected.type === 'imark-node') {
+    const pc = selected.pc;
+    const block = pcToBlock[pc] || null;
+    // c3: replace full per-transition sections with the compact
+    // renderTransitionIndex (B3 helper). Each row shows kind /
+    // jumpkind / tgt / guard summary / sub field count; click → drill
+    // into transition detail (which has the full info: full guard
+    // prose, expanded sub fields, exit_flag_status, tgt_smt, etc.).
+    // The detail panel is now an INDEX of outgoing transitions (the
+    // "imark sidebar index" original c3 spec) instead of a slab of
+    // verbose section blocks. For multi-transition imarks (Jcc emits
+    // 2) this is a major readability win; for single-transition imarks
+    // it's a minor change (one row vs one section, both equivalent
+    // entry points to transition detail).
+    const transitionsFromHere = [];
+    (lts.transitions || []).forEach((t, i) => {
+      if (t.src === pc) transitionsFromHere.push(Object.assign({}, t, { _idx: i }));
+    });
+    const insn = pcToInsn[pc] || null;
+    el.innerHTML = `
+      <section class="detail">
+        <h2>Instruction</h2>
+        ${insn ? `<div class="asm-line"><span class="asm-mnem">${escapeHtml(insn.mnemonic)}</span> <span class="asm-op">${escapeHtml(insn.op_str)}</span></div>` : ''}
+        <div class="row"><span class="k">pc</span><span class="v">${escapeHtml(pc)}</span></div>
+        <div class="row"><span class="k">block</span><span class="v">${escapeHtml(block || '<unknown>')}</span></div>
+        ${insn ? `<div class="row"><span class="k">size</span><span class="v">${insn.size} bytes</span></div>` : ''}
+        ${insn ? `<div class="row"><span class="k">in block</span><span class="v">#${insn.index_in_block}</span></div>` : ''}
+        <div class="row"><span class="k">transitions</span><span class="v">${transitionsFromHere.length}</span></div>
+      </section>
+      ${renderSourceWindowHtml(sourceWindowForImark(pc, 2, 3))}
+      <section class="detail">
+        <h2>Outgoing transitions · ${transitionsFromHere.length}</h2>
+        ${renderTransitionIndex(transitionsFromHere)}
+      </section>
+    `;
+    // c2.7.4: source-window line click → select first instruction on that line.
+    wireSourceWindowClicks(el);
+    // c3: transition-index row click → selectImarkTransition.
+    wireTransitionIndexClicks(el);
+  } else if (selected.type === 'imark-transition') {
+    // LTS-refactor commit 2: dedicated detail view when a Voogd branch
+    // is selected (vs its source control location). codex c2: header
+    // MUST surface kind/jumpkind/guard so the semantic distinction
+    // between exit-vs-default-vs-primitive survives the selected-color
+    // override on the edge itself.
+    const idx = selected.idx;
+    const t = imarkTransitionByIdx(idx);
+    if (!t) {
+      el.innerHTML = `<h2>Transition</h2><p class="placeholder">No metadata for transition idx ${idx}.</p>`;
+      return;
+    }
+    const containingBlock = pcToBlock[t.src] || null;
+    const insn = pcToInsn[t.src] || null;
+    const subEntries = t.sub ? Object.entries(t.sub) : [];
+    const subBadge = subEntries.length
+      ? `<span class="v">${subEntries.length} field${subEntries.length === 1 ? '' : 's'}</span>`
+      : `<span class="v"><i>empty</i></span>`;
+    const tgtCell = t.tgt == null ? '<i>(symbolic / ret)</i>' : escapeHtml(t.tgt);
+    // Sophie's followup (2026-04-29 evening): all detail panels follow
+    // ASM listing → Source listing → Relational transformer ordering.
+    // Imark-transition: the asm-row in metadata IS the ASM listing
+    // (single instruction at t.src); Source comes after metadata;
+    // sub expansion / guard / tgt_smt / exit_flag_status are the
+    // relational-transformer details, separated into their own
+    // section AFTER source.
+    el.innerHTML = `
+      <section class="detail">
+        <h2>Transition ${escapeHtml(imarkTransitionId(idx))}</h2>
+        <div class="row"><span class="k">kind</span><span class="v">${escapeHtml(t.kind)}</span></div>
+        <div class="row"><span class="k">jumpkind</span><span class="v">${escapeHtml(t.jumpkind || '')}</span></div>
+        <div class="row"><span class="k">src</span><span class="v"><a href="#" class="trans-link" data-action="select-imark" data-pc="${escapeHtml(t.src)}">${escapeHtml(t.src)}</a></span></div>
+        <div class="row"><span class="k">tgt</span><span class="v">${tgtCell}</span></div>
+        ${t.callee_sym ? `<div class="row"><span class="k">callee</span><span class="v">${escapeHtml(t.callee_sym)}</span></div>` : ''}
+        ${containingBlock ? `<div class="row"><span class="k">block</span><span class="v"><a href="#" class="trans-link" data-action="select-block" data-addr="${escapeHtml(containingBlock)}">${escapeHtml(containingBlock)}</a></span></div>` : ''}
+      </section>
+      <section class="detail">
+        <h2>Instruction</h2>
+        ${insn ? `<div class="asm-line"><span class="asm-mnem">${escapeHtml(insn.mnemonic)}</span> <span class="asm-op">${escapeHtml(insn.op_str)}</span></div>` : ''}
+        <div class="row"><span class="k">pc</span><span class="v"><a href="#" class="trans-link" data-action="select-imark" data-pc="${escapeHtml(t.src)}">${escapeHtml(t.src)}</a></span></div>
+        ${insn ? `<div class="row"><span class="k">size</span><span class="v">${insn.size} bytes</span></div>` : ''}
+        ${insn ? `<div class="row"><span class="k">in block</span><span class="v">#${insn.index_in_block}</span></div>` : ''}
+      </section>
+      ${renderSourceWindowHtml(sourceWindowForImark(t.src, 2, 3))}
+      <section class="detail">
+        <h2>Relational transformer</h2>
+        <div class="row"><span class="k">sub</span>${subBadge}</div>
+        ${t.guard && t.guard !== 'true' ? `<div class="section-label">guard / path-condition</div><pre>${escapeHtml(t.guard)}</pre>` : `<div class="section-label">guard / path-condition</div><p class="placeholder">true (unconditional)</p>`}
+        ${t.tgt_smt ? `<div class="section-label">tgt_smt</div><pre>${escapeHtml(t.tgt_smt)}</pre>` : ''}
+        ${subEntries.length ? `<div class="section-label">sub · relational transformer (${subEntries.length} field${subEntries.length === 1 ? '' : 's'})</div><div class="section-children">${renderSubBlock(t.sub)}</div>` : ''}
+        ${t.exit_flag_status && Object.keys(t.exit_flag_status).length ? `<div class="section-label">exit_flag_status</div><pre>${escapeHtml(JSON.stringify(t.exit_flag_status))}</pre>` : ''}
+      </section>
+    `;
+    // Wire containing-block and containing-imark links. Click writes
+    // through the central selection helpers (no breadcrumb history per
+    // codex c2; selection is a current entity, not a stack).
+    el.querySelectorAll('.trans-link').forEach(node => {
+      node.addEventListener('click', e => {
+        e.preventDefault();
+        const action = node.getAttribute('data-action');
+        if (action === 'select-imark') {
+          const p = node.getAttribute('data-pc');
+          if (p) selectImark(p, { source: 'detail-link' });
+        } else if (action === 'select-block') {
+          const a = node.getAttribute('data-addr');
+          if (a) selectBlock(a, { source: 'detail-link' });
+        }
+      });
+    });
+    // c2.7.5 (codex c2.7.4.1 follow-up): transition-detail source window.
+    // Same shape as imark detail — the transition's source context is
+    // the instruction at t.src. Clicking a source line in this view
+    // navigates back to the imark (selectImark), since the transition
+    // would no longer be the same entity if a different control
+    // location is chosen.
+    wireSourceWindowClicks(el);
+  } else if (selected.type === 'source-range') {
+    // B3 (idea B): full source-range detail panel.
+    //   - file + line bounds + imark/transition counts
+    //   - source window with .in-range visual (B1)
+    //   - combined disassembly listing (renderAsmListing) for every
+    //     imark whose pc is in the range, in instruction-pc order
+    //   - transition enumeration (renderTransitionIndex) for every
+    //     imark transition whose src pc is in the range
+    //   - empty-range placeholder when pcs.length === 0
+    // (B2 already added the cytoscape subgraph fade across cyBlock /
+    // cyScoped / cyFull, applied via applySourceRangeHighlight from
+    // selectSourceRange.)
+    const { source_file, startLine, endLine, pcs } = selected;
+    const win = sourceWindowForRange(source_file, startLine, endLine, 2, 2);
+    const lineCount = endLine - startLine + 1;
+    // Collect all imark transitions whose source program-counter is
+    // in the range. Tag each with its stable transition-index so the
+    // shared renderTransitionIndex helper can route clicks back to
+    // selectImarkTransition.
+    const pcsSet = new Set(pcs);
+    const transitions = [];
+    (lts.transitions || []).forEach((t, i) => {
+      if (pcsSet.has(t.src)) transitions.push(Object.assign({}, t, { _idx: i }));
+    });
+    // Sort pcs in instruction-pc order so the disassembly listing
+    // reads top-down by address. fileLineToPcs traverses lines in
+    // order, but multiple imarks per line are insertion-order — sort
+    // ascending hex to enforce a stable, locally-monotonic ordering.
+    const sortedPcs = pcs.slice().sort((a, b) => {
+      const av = parseInt(a, 16);
+      const bv = parseInt(b, 16);
+      return av - bv;
+    });
+    // Sophie's followup ordering rule: ASM listing → Source listing
+    // → Relational transformer (here = transitions from in-range
+    // imarks). Disassembly is now BEFORE the source window; transition
+    // enumeration follows source.
+    el.innerHTML = `
+      <section class="detail">
+        <h2>Source range</h2>
+        <div class="row"><span class="k">file</span><span class="v">${escapeHtml(source_file)}</span></div>
+        <div class="row"><span class="k">lines</span><span class="v">${startLine}–${endLine} (${lineCount} line${lineCount === 1 ? '' : 's'})</span></div>
+        <div class="row"><span class="k">instructions</span><span class="v">${pcs.length}</span></div>
+        <div class="row"><span class="k">transitions from instructions</span><span class="v">${transitions.length}</span></div>
+        ${pcs.length === 0
+          ? `<p class="placeholder">No instructions emit from this source-line range. Range covers comments / declarations / dead code.</p>`
+          : ''}
+      </section>
+      ${pcs.length > 0 ? `
+        <section class="detail">
+          <h2>Disassembly · ${pcs.length} instruction${pcs.length === 1 ? '' : 's'}</h2>
+          ${renderAsmListing(sortedPcs)}
+        </section>
+      ` : ''}
+      ${renderSourceWindowHtml(win)}
+      ${pcs.length > 0 ? `
+        <section class="detail">
+          <h2>Transitions · ${transitions.length} from instructions in range</h2>
+          ${renderTransitionIndex(transitions)}
+        </section>
+      ` : ''}
+    `;
+    wireSourceWindowClicks(el);
+    wireAsmListingClicks(el);
+    wireTransitionIndexClicks(el);
+  } else if (selected.type === 'block-transition') {
+    // c4: block-LTS transition detail. Composed-imark relational
+    // transformer for a single block transition. Rendered when the
+    // user clicks a real block-LTS edge in cyBlock (one edge per
+    // blockLts.transitions entry, post-c4 realBlockEdges()).
+    const idx = selected.idx;
+    const t = blockTransitionByIdx(idx);
+    if (!t) {
+      el.innerHTML = `<h2>Block transition</h2><p class="placeholder">No metadata for block-transition idx ${idx}.</p>`;
+      return;
+    }
+    const subEntries = t.sub ? Object.entries(t.sub) : [];
+    const subBadge = subEntries.length
+      ? `<span class="v">${subEntries.length} field${subEntries.length === 1 ? '' : 's'}</span>`
+      : `<span class="v"><i>empty</i></span>`;
+    const tgtCell = t.tgt == null
+      ? '<i>(symbolic / ret)</i>'
+      : `<a href="#" class="trans-link" data-action="select-block" data-addr="${escapeHtml(t.tgt)}">${escapeHtml(t.tgt)}</a>`;
+    // Sophie's followup (2026-04-29 evening): all detail panels follow
+    // ASM listing → Source listing → Relational transformer ordering.
+    // Block-transition: src block's full disassembly (the imarks
+    // composed into this block-LTS transition) → src block's source
+    // coverage → guard / sub expansion / exit_flag_status (the
+    // composed relational transformer details).
+    const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+    const srcBb = fn ? (fn.basic_blocks || []).find(b => b.addr === t.src) : null;
+    const srcBlockPcs = srcBb ? srcBb.instruction_pcs : [];
+    el.innerHTML = `
+      <section class="detail">
+        <h2>Block transition ${escapeHtml(blockTransitionId(idx))}</h2>
+        <div class="row"><span class="k">kind</span><span class="v">${escapeHtml(t.kind)}</span></div>
+        <div class="row"><span class="k">jumpkind</span><span class="v">${escapeHtml(t.jumpkind || '')}</span></div>
+        <div class="row"><span class="k">src block</span><span class="v"><a href="#" class="trans-link" data-action="select-block" data-addr="${escapeHtml(t.src)}">${escapeHtml(t.src)}</a></span></div>
+        <div class="row"><span class="k">tgt block</span><span class="v">${tgtCell}</span></div>
+        ${t.callee_sym ? `<div class="row"><span class="k">callee</span><span class="v">${escapeHtml(t.callee_sym)}</span></div>` : ''}
+      </section>
+      ${srcBlockPcs.length > 0 ? `
+        <section class="detail">
+          <h2>Disassembly · src block ${escapeHtml(t.src)} · ${srcBlockPcs.length} instruction${srcBlockPcs.length === 1 ? '' : 's'}</h2>
+          ${renderAsmListing(srcBlockPcs)}
+        </section>
+      ` : ''}
+      ${renderSourceWindowHtml(sourceWindowForBlock(t.src, 2, 2))}
+      <section class="detail">
+        <h2>Composed relational transformer</h2>
+        <div class="row"><span class="k">sub</span>${subBadge}</div>
+        ${t.guard && t.guard !== 'true' ? `<div class="section-label">guard / path-condition</div><pre>${escapeHtml(t.guard)}</pre>` : `<div class="section-label">guard / path-condition</div><p class="placeholder">true (unconditional)</p>`}
+        ${t.tgt_smt ? `<div class="section-label">tgt_smt</div><pre>${escapeHtml(t.tgt_smt)}</pre>` : ''}
+        ${subEntries.length ? `<div class="section-label">sub · composed (${subEntries.length} field${subEntries.length === 1 ? '' : 's'})</div><div class="section-children">${renderSubBlock(t.sub)}</div>` : ''}
+        ${t.exit_flag_status && Object.keys(t.exit_flag_status).length ? `<div class="section-label">exit_flag_status</div><pre>${escapeHtml(JSON.stringify(t.exit_flag_status))}</pre>` : ''}
+      </section>
+    `;
+    el.querySelectorAll('.trans-link').forEach(node => {
+      node.addEventListener('click', e => {
+        e.preventDefault();
+        const action = node.getAttribute('data-action');
+        if (action === 'select-block') {
+          const a = node.getAttribute('data-addr');
+          if (a) selectBlock(a, { source: 'detail-link' });
+        }
+      });
+    });
+    wireAsmListingClicks(el);
+    wireSourceWindowClicks(el);
+  } else if (selected.type === 'imark-range') {
+    // A2 (idea A): full imark-range detail panel.
+    //   - metadata: range kind classification, blocks, pc bounds,
+    //     imark count, transition count
+    //   - source coverage section (when uniform source file)
+    //   - combined disassembly (renderAsmListing)
+    //   - transition enumeration (renderTransitionIndex)
+    // A3 will add a block-aligned composed-effect section when the
+    // selected range exactly matches a basic_block.instruction_pcs.
+    const { pcs, transitionIdxs, rangeKind, rangeBlocks, rangeClassReason } = selected;
+    const transitions = (transitionIdxs || []).map(i =>
+      Object.assign({}, lts.transitions[i], { _idx: i })
+    );
+    const blocks = rangeBlocks || [];
+    // Source coverage: which files / lines are touched.
+    const sourceIdx = _ensureSourceIndex();
+    const sourceFiles = new Set();
+    const linesByFile = {};
+    for (const pc of pcs) {
+      const loc = sourceIdx.pcToLoc[pc];
+      if (loc) {
+        sourceFiles.add(loc.source_file);
+        if (!linesByFile[loc.source_file]) linesByFile[loc.source_file] = new Set();
+        linesByFile[loc.source_file].add(loc.source_line);
+      }
+    }
+    const uniqueFile = sourceFiles.size === 1 ? Array.from(sourceFiles)[0] : null;
+    let sourceCoverageRow = '';
+    let sourceWindowHtml = '';
+    if (uniqueFile) {
+      const ls = Array.from(linesByFile[uniqueFile]);
+      const minLine = Math.min.apply(null, ls);
+      const maxLine = Math.max.apply(null, ls);
+      sourceCoverageRow = `<div class="row"><span class="k">source coverage</span><span class="v">${escapeHtml(uniqueFile)}:${minLine}–${maxLine} (${ls.length} line${ls.length === 1 ? '' : 's'})</span></div>`;
+      // Render a source window over the range. Don't carry rangeStart/
+      // rangeEnd — the imark-range visual is on the cytoscape graphs
+      // (NOT the source window); marking source lines as in-range here
+      // would conflate idea A's selection with idea B's selection
+      // visual. Use sourceWindowForBlock for a clean line-context view.
+      // Actually simpler: directly construct a windowData with no
+      // rangeStart/rangeEnd, just hasInsns markers.
+      const fileEntry = sourceIdx.fileToLines[uniqueFile];
+      if (fileEntry) {
+        const linePcs = {};
+        for (const pc of pcs) {
+          const loc = sourceIdx.pcToLoc[pc];
+          if (!loc || loc.source_file !== uniqueFile) continue;
+          if (!linePcs[loc.source_line]) linePcs[loc.source_line] = [];
+          linePcs[loc.source_line].push(pc);
+        }
+        const lo = minLine - 1;
+        const hi = maxLine + 1;
+        const linesOut = [];
+        for (let n = lo; n <= hi; n++) {
+          if (n < 1) continue;
+          if (fileEntry.lines[n] === undefined) continue;
+          linesOut.push({
+            line: n,
+            text: fileEntry.lines[n],
+            hasInsns: !!linePcs[n],
+            pcs: linePcs[n] ? linePcs[n].slice() : [],
+          });
+        }
+        const windowData = [{
+          source_file: uniqueFile,
+          source_file_raw: fileEntry.source_file_raw,
+          source_comp_dir: fileEntry.source_comp_dir,
+          lines: linesOut,
+          activeLines: new Set(Object.keys(linePcs).map(n => parseInt(n, 10))),
+          pinnedLine: null,
+        }];
+        sourceWindowHtml = renderSourceWindowHtml(windowData);
+      }
+    } else if (sourceFiles.size > 1) {
+      sourceCoverageRow = `<div class="row"><span class="k">source coverage</span><span class="v">${sourceFiles.size} files (multi-file range, source window omitted)</span></div>`;
+    }
+    const blocksRow = blocks.length === 1
+      ? `<div class="row"><span class="k">block</span><span class="v">${escapeHtml(blocks[0])}</span></div>`
+      : `<div class="row"><span class="k">blocks</span><span class="v">${blocks.map(escapeHtml).join(', ')}</span></div>`;
+    const rangeBoundsRow = pcs.length > 0
+      ? `<div class="row"><span class="k">range</span><span class="v">${escapeHtml(pcs[0])}${pcs.length > 1 ? ' – ' + escapeHtml(pcs[pcs.length - 1]) : ''}</span></div>`
+      : '';
+    // A3 (idea A): block-aligned composed-effect display. When the
+    // selected range exactly equals bb.instruction_pcs in order, the
+    // user has selected an entire basic block — surface the existing
+    // block-LTS composed transitions (Voogd's compose_subs over the
+    // imark-LTS, computed at extraction time). For partial ranges we
+    // do NOT show the composed effect: the block-granular LTS
+    // composes ALL imarks in the block, not just the slice, so
+    // showing it for a partial range would be a false-friend
+    // (it would NOT be the composed effect of the slice).
+    const blockAlignedAddr = isBlockAligned(pcs);
+    const blockAlignedSection = blockAlignedAddr
+      ? `<section class="detail">
+           <h2>Block alignment</h2>
+           <div class="row"><span class="k">block</span><span class="v">${escapeHtml(blockAlignedAddr)}</span></div>
+           <div class="row"><span class="k">aligned</span><span class="v">range == bb.instruction_pcs (full block selected)</span></div>
+         </section>
+         ${renderBlockComposedEffects(blockAlignedAddr)}`
+      : '';
+    // Live-composed effect for linear ranges: chain-compose Voogd's
+    // compose_subs over the transitions in execution (pc-sorted) order.
+    // Substitution-only — no Z3 simplify yet (next commit). Result is
+    // algebraically correct but visually nested (e.g. (bvadd C1 (bvadd
+    // C2 rsp)) instead of the collapsed (bvadd (C1+C2) rsp)).
+    let liveComposedSection = '';
+    if (rangeKind === 'linear' && transitions.length > 0) {
+      // Sort transitions by their src position in pcs (chain order).
+      const orderedTs = transitions.slice().sort(
+        (a, b) => pcs.indexOf(a.src) - pcs.indexOf(b.src)
+      );
+      const composed = composeChain(orderedTs);
+      const composedGuard = composeChainGuard(orderedTs);
+      const composedEntries = Object.entries(composed);
+      const lastT = orderedTs[orderedTs.length - 1];
+      const composedTgt = lastT.tgt == null
+        ? '<i>(symbolic / ret)</i>'
+        : escapeHtml(lastT.tgt);
+      const subBody = composedEntries.length === 0
+        ? '<p class="placeholder">empty (no state change)</p>'
+        : `<div class="section-children">${composedEntries.map(([k, v]) =>
+            `<div class="row"><span class="k">${escapeHtml(k)}</span><span class="v" style="font-size:11px;">${escapeHtml(v)}</span></div>`
+          ).join('')}</div>`;
+      liveComposedSection = `
+        <section class="detail">
+          <h2>Composed relational transformer · ${orderedTs.length}-step chain (live, pre-simplify)</h2>
+          <div class="row"><span class="k">entry pc</span><span class="v">${escapeHtml(orderedTs[0].src)}</span></div>
+          <div class="row"><span class="k">exit pc</span><span class="v">${composedTgt}</span></div>
+          <div class="row"><span class="k">fields touched</span><span class="v">${composedEntries.length}</span></div>
+          ${composedGuard !== 'true' ? `<div class="section-label">guard / path-condition (composed)</div><pre>${escapeHtml(composedGuard)}</pre>` : `<div class="section-label">guard / path-condition (composed)</div><p class="placeholder">true (no path-condition along chain)</p>`}
+          <div class="section-label">sub · composed (${composedEntries.length} field${composedEntries.length === 1 ? '' : 's'}) — Voogd compose_subs, JS substitution-only</div>
+          ${subBody}
+          <p class="placeholder" style="font-size:11px;">Z3 simplify (next commit) will collapse nested (bvadd C1 (bvadd C2 x)) → (bvadd (C1+C2) x) and similar.</p>
+        </section>
+      `;
+    }
+    // Sophie's followup ordering rule: ASM listing → Source listing
+    // → Relational transformer (here = live-composed for linear
+    // ranges + block-aligned composed effect when full-block-selected
+    // + per-instruction transition enumeration).
+    el.innerHTML = `
+      <section class="detail">
+        <h2>Instruction range</h2>
+        <div class="row"><span class="k">range kind</span><span class="v" title="${escapeHtml(rangeClassReason || '')}">${escapeHtml(rangeKind)}</span></div>
+        ${blocksRow}
+        ${rangeBoundsRow}
+        <div class="row"><span class="k">instructions</span><span class="v">${pcs.length}</span></div>
+        <div class="row"><span class="k">transitions from instructions</span><span class="v">${transitions.length}</span></div>
+        ${sourceCoverageRow}
+      </section>
+      <section class="detail">
+        <h2>Disassembly · ${pcs.length} instruction${pcs.length === 1 ? '' : 's'}</h2>
+        ${renderAsmListing(pcs)}
+      </section>
+      ${sourceWindowHtml}
+      ${liveComposedSection}
+      ${blockAlignedSection}
+      <section class="detail">
+        <h2>Transitions · ${transitions.length} from instructions in range</h2>
+        ${renderTransitionIndex(transitions)}
+      </section>
+    `;
+    wireSourceWindowClicks(el);
+    wireAsmListingClicks(el);
+    wireTransitionIndexClicks(el);
+  } else {
+    // Future variants land here until their respective commits
+    // implement dedicated renderers. After c4/c3 ship, only idea C
+    // (source AST overlay) remains as a future selection-related
+    // mode; non-selection-derived placeholders (errors, init) flow
+    // through the early-return path above.
+    el.innerHTML = `<h2>Detail</h2><p class="placeholder">Detail for selection type "${escapeHtml(selected.type)}" not yet implemented.</p>`;
+  }
+  // Polish followup #26: scrollIntoView on source-line.active so the
+  // pinned source line is centered in any scrollable container after
+  // the detail panel re-renders. block: 'center' positions the line
+  // in the middle of the viewport; behavior: 'auto' avoids smooth-
+  // scroll animation (immediate jump). No-op if the line is already
+  // visible. Applies to imark/source-range/imark-range branches that
+  // emit a .source-line.active (via group.pinnedLine in
+  // sourceWindowFor* output).
+  const activeLine = el.querySelector('.source-line.active');
+  if (activeLine && typeof activeLine.scrollIntoView === 'function') {
+    activeLine.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+  }
+}
+
+// A3 (idea A) helper, also used by block-detail (refactored to call
+// this in A3): render the composed-block transitions for a block as
+// detail sections. blockToBlockTransitions[blockAddr] is populated
+// from the block-granular LTS file (BLOCK_LTS_PATH) when the
+// alignment validator passes; if the block-LTS is missing or
+// mismatched, blockToBlockTransitions stays empty for this block
+// and we render an explicit unavailable placeholder.
+//
+// Each composed transition gets one <section class="detail"> with
+// kind / jumpkind / tgt / optional callee / guard / tgt_smt / sub
+// (relational transformer) / exit_flag_status. Multiple block-LTS
+// transitions per block (Jcc-tail block emits 2 composed
+// transitions, one per branch) are all rendered.
+function renderBlockComposedEffects(blockAddr) {
+  const blockTransitions = blockToBlockTransitions[blockAddr] || [];
+  if (blockTransitions.length === 0) {
+    return `<section class="detail"><h2>Block-level transition</h2>` +
+           `<p class="placeholder">No block-granular LTS loaded — composed effect unavailable for this block. (Drop ${escapeHtml(BLOCK_LTS_PATH)} alongside imark.html to enable.)</p></section>`;
+  }
+  return blockTransitions.map((t, i) => {
+    const header = blockTransitions.length === 1
+      ? 'Transition · composed effect'
+      : `Transition ${i + 1} of ${blockTransitions.length} · composed effect`;
+    const sub = t.sub || {};
+    const subEntries = Object.entries(sub);
+    const subBody = subEntries.length === 0
+      ? '<p class="placeholder">empty (no state change)</p>'
+      : `<div class="section-children">${renderSubBlock(sub)}</div>`;
+    return `
+      <section class="detail">
+        <h2>${header}</h2>
+        <div class="row"><span class="k">kind</span><span class="v">${escapeHtml(t.kind)}</span></div>
+        <div class="row"><span class="k">jumpkind</span><span class="v">${escapeHtml(t.jumpkind || '')}</span></div>
+        <div class="row"><span class="k">tgt</span><span class="v">${t.tgt == null ? '<i>symbolic (ret)</i>' : escapeHtml(t.tgt)}</span></div>
+        ${t.callee_sym ? `<div class="row"><span class="k">callee</span><span class="v">${escapeHtml(t.callee_sym)}</span></div>` : ''}
+        ${t.guard && t.guard !== 'true' ? `<div class="section-label">guard</div><pre>${escapeHtml(t.guard)}</pre>` : ''}
+        ${t.tgt_smt ? `<div class="section-label">tgt_smt</div><pre>${escapeHtml(t.tgt_smt)}</pre>` : ''}
+        <div class="section-label">sub · relational transformer (${subEntries.length} field${subEntries.length === 1 ? '' : 's'})</div>
+        ${subBody}
+        ${t.exit_flag_status && Object.keys(t.exit_flag_status).length ? `<div class="section-label">exit_flag_status</div><pre>${escapeHtml(JSON.stringify(t.exit_flag_status))}</pre>` : ''}
+      </section>
+    `;
+  }).join('');
+}
+
+// A3 (idea A): block-alignment detector. Returns the block-addr if
+// the given pcs EXACTLY equals bb.instruction_pcs in order, else
+// null. Used by imark-range detail to decide whether to surface
+// the block-LTS composed-effect display: the composed transitions
+// are quotient summaries of the FULL block, so showing them when
+// only a partial range is selected would be a false-friend (the
+// composed effect is for ALL imarks in the block, not the slice).
+function isBlockAligned(pcs) {
+  if (!pcs || pcs.length === 0) return null;
+  const blockAddr = pcToBlock[pcs[0]];
+  if (!blockAddr) return null;
+  for (const pc of pcs) {
+    if (pcToBlock[pc] !== blockAddr) return null;
+  }
+  const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+  const bb = fn ? (fn.basic_blocks || []).find(b => b.addr === blockAddr) : null;
+  if (!bb) return null;
+  if (bb.instruction_pcs.length !== pcs.length) return null;
+  for (let i = 0; i < pcs.length; i++) {
+    if (pcs[i] !== bb.instruction_pcs[i]) return null;
+  }
+  return blockAddr;
+}
+
+function renderSubBlock(sub) {
+  const rows = Object.entries(sub).map(([k, v]) => {
+    return `<div class="row"><span class="k">${escapeHtml(k)}</span><span class="v" style="font-size:11px;">${escapeHtml(v)}</span></div>`;
+  });
+  return rows.join('');
+}
+
+// c2.7.4: render the source-window section from sourceWindowForBlock /
+// sourceWindowForImark output. Returns full HTML including the
+// surrounding <section class="detail">. Empty array (no source info) →
+// "no DWARF mapping" placeholder. Multi-file groups render in order.
+function renderSourceWindowHtml(windowData) {
+  if (!windowData || windowData.length === 0) {
+    return `
+      <section class="detail">
+        <h2>Source</h2>
+        <div class="source-window-empty">no DWARF source mapping for this selection</div>
+      </section>
+    `;
+  }
+  const groupsHtml = windowData.map(group => {
+    if (group.lines.length === 0) {
+      // File entry exists but no embedded line text — re-extract
+      // with QFABV_SOURCE_ROOTS to populate.
+      return `
+        <div class="source-window">
+          <div class="source-window-file-header">
+            <span class="path">${escapeHtml(group.source_file)}</span>
+            <span class="range">text not embedded</span>
+          </div>
+          <div class="source-window-empty">re-extract with QFABV_SOURCE_ROOTS=&lt;src tree&gt; to embed line text</div>
+        </div>
+      `;
+    }
+    const minLine = group.lines[0].line;
+    const maxLine = group.lines[group.lines.length - 1].line;
+    const linesHtml = group.lines.map(l => {
+      const cls = ['source-line'];
+      if (l.hasInsns) cls.push('has-insns');
+      // c2.7.4.1 (codex c2.7.4 [Medium] 2): explicit pinned-line
+      // signal from the windowData, NOT inferred from activeLines
+      // size. Block selection has pinnedLine === null → no .active.
+      // Imark selection has pinnedLine === loc.source_line → that
+      // line gets .active (strong fill).
+      if (group.pinnedLine != null && l.line === group.pinnedLine) {
+        cls.push('active');
+      }
+      // B1 (idea B): if the windowData carries rangeStart/rangeEnd
+      // (sourceWindowForRange output), mark every line within those
+      // bounds with .in-range so the user sees the selection extent
+      // visually in the source window.
+      if (group.rangeStart != null && group.rangeEnd != null
+          && l.line >= group.rangeStart && l.line <= group.rangeEnd) {
+        cls.push('in-range');
+      }
+      // B1.1 (codex B1 [Low]): persistent shift-anchor visual.
+      // Re-apply .shift-anchor on every render so the anchor stays
+      // visible across selection-change re-renders. Without this,
+      // a sticky `_sourceClickAnchor` becomes invisible after the
+      // first shift-click navigates or after the first range is
+      // formed and the renderer fires fresh HTML.
+      if (_sourceClickAnchor
+          && _sourceClickAnchor.source_file === group.source_file
+          && l.line === _sourceClickAnchor.line) {
+        cls.push('shift-anchor');
+      }
+      // Per-line scoped pcs (codex c2.7.4 [Medium] 1): embed the pc
+      // list as a data attribute so the click handler doesn't need to
+      // do a function-global instructionsForSourceLine lookup. The
+      // pcs are already scoped to the current block / imark by the
+      // sourceWindowForBlock / sourceWindowForImark builders.
+      const pcsAttr = (l.pcs && l.pcs.length)
+        ? ` data-pcs="${escapeHtml(l.pcs.join(','))}"`
+        : '';
+      return `<div class="${cls.join(' ')}" data-source-file="${escapeHtml(group.source_file)}" data-source-line="${l.line}"${pcsAttr}>` +
+             `<span class="lineno">${l.line}</span>` +
+             `<span class="src">${escapeHtml(l.text)}</span>` +
+             `</div>`;
+    }).join('');
+    return `
+      <div class="source-window">
+        <div class="source-window-file-header">
+          <span class="path">${escapeHtml(group.source_file)}</span>
+          <span class="range">${minLine}–${maxLine}</span>
+        </div>
+        ${linesHtml}
+      </div>
+    `;
+  }).join('');
+  return `
+    <section class="detail">
+      <h2>Source</h2>
+      ${groupsHtml}
+    </section>
+  `;
+}
+
+// Attach click handlers to source-window lines. Plain-click on a
+// has-insns line → select the first imark in the CURRENT scope (per
+// data-pcs scoped at render time, codex c2.7.4 [Medium] 1). Plain-
+// click on a non-imark line → set anchor only (B1.1, codex B1
+// [Medium]). Shift-click on any line → form/extend a source-range
+// (idea B). Plain-click is the existing imark-drill semantic; shift-
+// click is the new range semantic.
+//
+// Note (codex c2.7.4 [Low]): single-selection invariant means siblings
+// on the same source line stay un-selected. The existing viewer has
+// no multi-pin visual primitive — implementing related-highlight is a
+// follow-up if sophie wants it.
+function wireSourceWindowClicks(rootEl) {
+  // B1.1 (codex B1 [Medium]): handler attaches to ALL .source-line
+  // (not just .has-insns) so range endpoints can be comments,
+  // declarations, blank lines, etc. Sophie's idea B is "select source
+  // LINES" — line semantics, not imark-bearing-line semantics.
+  // The empty-range placeholder ("range covers comments / declarations
+  // / dead code") is now reachable: shift-click two non-imark lines
+  // → range with 0 pcs → that placeholder fires.
+  rootEl.querySelectorAll('.source-line').forEach(node => {
+    node.addEventListener('click', evt => {
+      const sf = node.getAttribute('data-source-file') || '';
+      const lineStr = node.getAttribute('data-source-line') || '';
+      const line = parseInt(lineStr, 10);
+      if (!sf || !Number.isInteger(line)) return;
+
+      // B1 (idea B): shift-click → source-range selection. Two-step UX:
+      //   first shift-click in a file sets the anchor without
+      //   navigating (so the user stays in whatever wide-window view
+      //   they're in — block detail's source window often spans
+      //   many more lines than the imark-detail one);
+      //   second shift-click in the same file forms the range.
+      // After a plain-click, the anchor is also set, so a single
+      // shift-click immediately after a plain-click also forms a
+      // range — but the source window then is the imark-detail one
+      // and the available range is constrained to its context radius.
+      if (evt.shiftKey) {
+        if (!_sourceClickAnchor || _sourceClickAnchor.source_file !== sf) {
+          // First shift-click in this file: set anchor only, no
+          // navigation. Stop here so plain-click semantics don't fire.
+          _sourceClickAnchor = { source_file: sf, line };
+          // In-place visual anchor mark — survives until next render
+          // (renderSourceWindowHtml also re-applies .shift-anchor on
+          // re-render so the mark survives selection-change re-renders
+          // too, per codex B1 [Low]).
+          rootEl.querySelectorAll('.source-line.shift-anchor').forEach(n => {
+            n.classList.remove('shift-anchor');
+          });
+          node.classList.add('shift-anchor');
+          evt.preventDefault();
+          evt.stopPropagation();
+          return;
+        }
+        // Anchor exists AND shares the source_file: form range. Range
+        // endpoints can be non-imark lines per [Medium] fix above.
+        const startLine = Math.min(_sourceClickAnchor.line, line);
+        const endLine = Math.max(_sourceClickAnchor.line, line);
+        selectSourceRange(sf, startLine, endLine, { source: 'source-line-shift' });
+        evt.preventDefault();
+        evt.stopPropagation();
+        return;
+      }
+
+      // Plain click: always refresh anchor to the clicked line. If the
+      // line has imarks, ALSO navigate to the first scoped pc (existing
+      // behavior — clicking a source line drills into the imark on it).
+      // If the line has no imarks, anchor-update only — no navigation,
+      // visible .shift-anchor mark on the line.
+      _sourceClickAnchor = { source_file: sf, line };
+      const pcsAttr = node.getAttribute('data-pcs') || '';
+      const pcs = pcsAttr.split(',').map(s => s.trim()).filter(Boolean);
+      if (pcs.length === 0) {
+        // Anchor-only: refresh visual without re-render (no selection
+        // mutation happened).
+        rootEl.querySelectorAll('.source-line.shift-anchor').forEach(n => {
+          n.classList.remove('shift-anchor');
+        });
+        node.classList.add('shift-anchor');
+        return;
+      }
+      selectImark(pcs[0], { source: 'source-line' });
+    });
+  });
+}
+
+// B3 (idea B): combined disassembly listing for an arbitrary set of
+// program-counter values. Same row format as the inline ASM listing
+// in block detail (codex c2.7.3): pc | mnemonic | op_str | optional
+// source file:line. Used by source-range detail and reusable for
+// idea A's imark-range detail in subsequent commits.
+//
+// `pcs` is an array of pc-string keys. The helper preserves caller-
+// chosen order — callers that want monotonic addresses must sort
+// before passing in.
+function renderAsmListing(pcs) {
+  if (!pcs || pcs.length === 0) {
+    return '<p class="placeholder">No instructions in selection.</p>';
+  }
+  const lines = pcs.map(p => {
+    const insn = pcToInsn[p];
+    const loc = sourceLocForInstruction(p);
+    const srcHtml = loc
+      ? `<span class="asm-listing-src">` +
+          `<span class="file">${escapeHtml(loc.source_file_raw)}</span>` +
+          `<span class="line">${loc.source_line}</span>` +
+        `</span>`
+      : '';
+    const rowClass = loc ? 'asm-listing-line with-src' : 'asm-listing-line';
+    if (insn) {
+      return `<div class="${rowClass}" data-pc="${escapeHtml(p)}">` +
+             `<span class="asm-listing-pc">${escapeHtml(p)}</span>` +
+             `<span class="asm-listing-mnem">${escapeHtml(insn.mnemonic)}</span>` +
+             `<span class="asm-listing-op">${escapeHtml(insn.op_str)}</span>` +
+             srcHtml +
+             `</div>`;
+    }
+    return `<div class="${rowClass}" data-pc="${escapeHtml(p)}">` +
+           `<span class="asm-listing-pc">${escapeHtml(p)}</span>` +
+           `<span class="asm-listing-mnem placeholder">(no asm metadata)</span>` +
+           srcHtml +
+           `</div>`;
+  }).join('');
+  return `<div class="asm-listing">${lines}</div>`;
+}
+
+function wireAsmListingClicks(rootEl) {
+  rootEl.querySelectorAll('.asm-listing-line').forEach(node => {
+    node.addEventListener('click', () => {
+      const p = node.getAttribute('data-pc');
+      if (p) selectImark(p, { source: 'detail-list' });
+    });
+  });
+}
+
+// B3 (idea B): compact transition enumeration. One row per imark
+// transition. Used by source-range detail (B3) and reusable for
+// idea A's imark-range detail + c3's imark sidebar of outgoing
+// transitions.
+//
+// `transitions` is an array of imark-transition objects. Each MUST
+// carry `_idx` set to the transition's stable index in
+// lts.transitions (the renderer cannot derive it from the object
+// itself — codex c1 LTS-refactor: transition identity is the index,
+// not derivable from src/tgt alone since multiple transitions can
+// share src). Callers attach _idx before passing in:
+//
+//     transitions.push(Object.assign({}, t, { _idx: i }));
+//
+// Click on a row → selectImarkTransition(idx). Layout is a horizontal
+// grid: id | src → tgt | kind | guard summary | sub field count.
+function renderTransitionIndex(transitions) {
+  if (!transitions || transitions.length === 0) {
+    return '<p class="placeholder">No transitions in selection.</p>';
+  }
+  const rows = transitions.map(t => {
+    const idx = t._idx;
+    const id = (typeof imarkTransitionId === 'function')
+      ? imarkTransitionId(idx)
+      : ('t' + idx);
+    const tgtCell = t.tgt == null ? '<i>ret</i>' : escapeHtml(t.tgt);
+    const guardText = (t.guard && t.guard !== 'true')
+      ? (t.guard.length > 40 ? t.guard.slice(0, 37) + '…' : t.guard)
+      : '';
+    // B3.1 (codex B3 [Medium]): always emit a .ti-guard child element
+    // so the 7-column .transition-index-row grid stays aligned across
+    // unconditional transitions (guard='true'). Empty span keeps the
+    // grid slot occupied without rendering any text.
+    const guardCell = guardText
+      ? `<span class="ti-guard" title="${escapeHtml(t.guard)}">[${escapeHtml(guardText)}]</span>`
+      : `<span class="ti-guard"></span>`;
+    const subFieldCount = t.sub ? Object.keys(t.sub).length : 0;
+    const subCell = subFieldCount > 0
+      ? `<span class="ti-sub">Δ ${subFieldCount}</span>`
+      : '<span class="ti-sub-empty">·</span>';
+    return `<div class="transition-index-row kind-${escapeHtml(t.kind)}" data-transition-idx="${idx}">` +
+           `<span class="ti-id">${escapeHtml(id)}</span>` +
+           `<span class="ti-src">${escapeHtml(t.src)}</span>` +
+           `<span class="ti-arrow">→</span>` +
+           `<span class="ti-tgt">${tgtCell}</span>` +
+           `<span class="ti-kind">${escapeHtml(t.kind)}</span>` +
+           guardCell +
+           subCell +
+           `</div>`;
+  }).join('');
+  return `<div class="transition-index">${rows}</div>`;
+}
+
+function wireTransitionIndexClicks(rootEl) {
+  rootEl.querySelectorAll('.transition-index-row').forEach(node => {
+    node.addEventListener('click', () => {
+      const idxStr = node.getAttribute('data-transition-idx');
+      const idx = parseInt(idxStr, 10);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      selectImarkTransition(idx, { source: 'transition-index' });
+    });
+  });
+}
+
+// =====================================================================
+// Utilities
+// =====================================================================
+
+// =====================================================================
+// Transition-index helpers (LTS-refactor commit 1)
+//
+// Stable transition identity = its 0-based index in
+// lts.transitions (imark) or blockLts.transitions (block-granular).
+// Codex: 'transition_index serialized in the LTS' would be cleaner
+// later, but for v0 array index is sufficient. Helpers here own
+// the index-to-transition lookup so call sites don't sprinkle
+// indexOf() (O(n)) across the codebase.
+// =====================================================================
+
+// =====================================================================
+// LTS-refactor commit 2.5: action-language edge label
+//
+// Sophie picked option E from the ontology brainstorm: each LTS
+// transition becomes a process-calculus-style guarded action label
+// `[guard] / mnemonic op_str` on its edge. State nodes lose mnemonic
+// text — control location only. Two refinements per sophie's pick:
+//
+//   - DROP the [true] prefix on const-true edges. ~95% of edges are
+//     unconditional straight-line transitions; labeling them all with
+//     [true] is pure noise. Const-true edges show just `mnemonic op_str`.
+//   - NO global truncation. Imark-level guards are typically short
+//     single-flag-test predicates ((= rflags_ZF #b0) etc., 17-25 chars
+//     range). Long composed conjunctions accumulate at BLOCK level via
+//     compose_subs, not at imark level. Render verbatim; cytoscape's
+//     text-wrap engine handles the rare overflow case.
+//
+// Centralized helper so cyScoped + cyFull + (future c3) sidebar rows
+// all build labels the same way. Falls back to jumpkind / kind /
+// "transition" when pcToInsn metadata is missing (LTS predating
+// I.2.6b instruction[] field).
+// =====================================================================
+function instructionActionLabel(t) {
+  if (!t) return 'transition';
+  const insn = pcToInsn[t.src];
+  let action;
+  if (insn) {
+    action = insn.op_str ? `${insn.mnemonic} ${insn.op_str}` : insn.mnemonic;
+  } else {
+    // Fallback: surface jumpkind / kind so the edge is never empty.
+    action = t.jumpkind || t.kind || 'transition';
+  }
+  const guard = (t.guard || '').trim();
+  if (!guard || guard === 'true') return action;
+  return `[${guard}]\n${action}`;
+}
+
+// Imark-LTS transition by stable index (the same idx already
+// stored in cytoscape edge data via transitionIdx).
+function imarkTransitionByIdx(idx) {
+  if (lts && Array.isArray(lts.transitions) && idx >= 0 && idx < lts.transitions.length) {
+    return lts.transitions[idx];
+  }
+  return null;
+}
+
+// All imark-LTS transitions whose src matches the given PC. Returns
+// pairs [{idx, t}, ...] preserving original LTS order so callers
+// can render an EdgeIndex sidebar with stable identities.
+function imarkTransitionsFromSrc(pc) {
+  const out = [];
+  if (!lts || !Array.isArray(lts.transitions)) return out;
+  lts.transitions.forEach((t, idx) => {
+    if (t.src === pc) out.push({ idx, t });
+  });
+  return out;
+}
+
+// Block-granular-LTS transition by stable index. Block-LTS may be
+// absent (validated alignment failed, or no block-LTS file) — caller
+// should null-check.
+function blockTransitionByIdx(idx) {
+  if (blockLts && Array.isArray(blockLts.transitions) && idx >= 0 && idx < blockLts.transitions.length) {
+    return blockLts.transitions[idx];
+  }
+  return null;
+}
+
+// All block-LTS transitions whose src matches the given block addr.
+// Same shape as imarkTransitionsFromSrc.
+function blockTransitionsFromSrc(addr) {
+  const out = [];
+  if (!blockLts || !Array.isArray(blockLts.transitions)) return out;
+  blockLts.transitions.forEach((t, idx) => {
+    if (t.src === addr) out.push({ idx, t });
+  });
+  return out;
+}
+
+// Display-friendly stable IDs for the sidebar. Imark transitions
+// get 't<idx>' (e.g. t42); block transitions get 'bt<idx>' (e.g.
+// bt17). Codex's recommendation; visually distinguishes the two
+// LTSes in the same UI.
+function imarkTransitionId(idx) { return `t${idx}`; }
+function blockTransitionId(idx) { return `bt${idx}`; }
+
+
+// =====================================================================
+// LTS-refactor commit 2.7.2: source-listings data-index helpers
+//
+// Pure read-only functions over the LTS. No UI changes here — UI
+// commits (c2.7.3 ASM column, c2.7.4 source window) consume these.
+//
+// Schema (c2.7.1 / c2.7.1.1):
+//   function_index[].instructions[i].{source_file, source_file_raw,
+//                                     source_comp_dir, source_line,
+//                                     source_column}
+//   function_index[].source_files[].{source_file, source_file_raw,
+//                                    source_comp_dir, lines:[{line,text}]}
+//
+// Codex c2.7.1 [Medium] downstream note: lookups must key by
+// (source_file, source_line) — basename-only collision (a/same.c +
+// b/same.c) would silently route clicks to the wrong file. Helpers
+// here use the dir-prefixed source_file as the canonical file key.
+// =====================================================================
+
+// Index built once per LTS load: pc → SourceLoc-shape, source_file →
+// {raw, comp_dir, lines: line→text}, (source_file, line) → list of
+// instruction PCs that emit from that source line.
+let _sourceIndex = null;
+function _ensureSourceIndex() {
+  if (_sourceIndex) return _sourceIndex;
+  const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+  const idx = {
+    pcToLoc: {},                 // pc-string → {source_file, source_line, ...}
+    fileToLines: {},             // source_file → {raw, comp_dir, lines: {line: text}}
+    fileLineToPcs: {},           // `${source_file}\u0001${line}` → [pc-string, ...]
+  };
+  if (!fn) { _sourceIndex = idx; return idx; }
+  for (const ins of fn.instructions || []) {
+    if (!ins.source_file || !ins.source_line) continue;
+    idx.pcToLoc[ins.pc] = {
+      source_file: ins.source_file,
+      source_file_raw: ins.source_file_raw,
+      source_comp_dir: ins.source_comp_dir,
+      source_line: ins.source_line,
+      source_column: ins.source_column || 0,
+    };
+    const key = ins.source_file + '\u0001' + ins.source_line;
+    if (!idx.fileLineToPcs[key]) idx.fileLineToPcs[key] = [];
+    idx.fileLineToPcs[key].push(ins.pc);
+  }
+  for (const f of fn.source_files || []) {
+    const lineMap = {};
+    for (const lobj of f.lines || []) lineMap[lobj.line] = lobj.text;
+    idx.fileToLines[f.source_file] = {
+      source_file_raw: f.source_file_raw,
+      source_comp_dir: f.source_comp_dir,
+      lines: lineMap,
+    };
+  }
+  _sourceIndex = idx;
+  return idx;
+}
+
+// Source location for a single instruction, keyed by hex-string PC.
+// Returns null when no DWARF source info is attached.
+function sourceLocForInstruction(pc) {
+  const idx = _ensureSourceIndex();
+  return idx.pcToLoc[pc] || null;
+}
+
+// PCs (instruction hex strings) emitted from a given source line.
+// Used by source-line click → "select first imark on this line, related-
+// highlight the others" (codex c2.7 design call). Keyed by
+// (source_file, source_line) per c2.7.1.1 fixup.
+function instructionsForSourceLine(source_file, source_line) {
+  const idx = _ensureSourceIndex();
+  const key = source_file + '\u0001' + source_line;
+  return (idx.fileLineToPcs[key] || []).slice();
+}
+
+// Source-window content for a block. Returns one entry per source file
+// referenced by any instruction in the block, with the file's lines
+// covering [block_min - context, block_max + context] (within available
+// bounds from source_files[]). Codex c2.7 design: 2/2 default for
+// block view; caller passes whatever radius matches the UI.
+//
+// Shape (c2.7.4.1 schema with scoped pcs + explicit pinnedLine):
+//   [{ source_file, source_file_raw, source_comp_dir,
+//      lines: [{
+//        line:     int,
+//        text:     string,
+//        hasInsns: bool,    -- has imark(s) in current scope
+//        pcs:      [pc...]   -- scoped pcs that emit from this line
+//                              (empty for context lines without imarks)
+//      }],
+//      activeLines: Set<int>, -- lines that have ≥1 imark in this block
+//      pinnedLine:  null      -- block view has no single pinned line
+//   }]
+//
+// Returns [] when no source info attached or block has no imarks
+// with source mappings.
+function sourceWindowForBlock(blockAddr, contextAbove = 2, contextBelow = 2) {
+  const idx = _ensureSourceIndex();
+  const fn = (lts && lts.function_index && lts.function_index[0]) || null;
+  if (!fn || !blockAddr) return [];
+  const bb = (fn.basic_blocks || []).find(b => b.addr === blockAddr);
+  if (!bb) return [];
+  // Collect referenced (source_file, source_line) → [pc...] pairs SCOPED
+  // to this block's instructions. Codex c2.7.4 [Medium] 1: source-line
+  // click must select a pc IN THIS BLOCK, not the function-global first
+  // pc on that line. Storing per-line pcs in the windowData makes the
+  // click handler scoped automatically.
+  const filesToLinePcs = {};   // source_file → { line: [pc, ...] }
+  for (const pc of bb.instruction_pcs || []) {
+    const loc = idx.pcToLoc[pc];
+    if (!loc) continue;
+    if (!filesToLinePcs[loc.source_file]) filesToLinePcs[loc.source_file] = {};
+    if (!filesToLinePcs[loc.source_file][loc.source_line]) {
+      filesToLinePcs[loc.source_file][loc.source_line] = [];
+    }
+    filesToLinePcs[loc.source_file][loc.source_line].push(pc);
+  }
+  const out = [];
+  // Sort files by first-occurrence order in instruction_pcs (codex c2.7
+  // design: multi-file blocks render in instruction order, not
+  // alphabetical, so the inlined-call file appears below the main file).
+  const orderedFiles = [];
+  const seen = new Set();
+  for (const pc of bb.instruction_pcs || []) {
+    const loc = idx.pcToLoc[pc];
+    if (!loc) continue;
+    if (!seen.has(loc.source_file)) {
+      seen.add(loc.source_file);
+      orderedFiles.push(loc.source_file);
+    }
+  }
+  for (const sf of orderedFiles) {
+    const fileEntry = idx.fileToLines[sf];
+    if (!fileEntry) continue;
+    const linePcs = filesToLinePcs[sf];
+    const activeLines = new Set(Object.keys(linePcs).map(n => parseInt(n, 10)));
+    const arr = Array.from(activeLines);
+    const lo = Math.min.apply(null, arr) - contextAbove;
+    const hi = Math.max.apply(null, arr) + contextBelow;
+    const linesOut = [];
+    for (let n = lo; n <= hi; n++) {
+      if (n < 1) continue;
+      if (fileEntry.lines[n] === undefined) continue;
+      linesOut.push({
+        line: n,
+        text: fileEntry.lines[n],
+        hasInsns: activeLines.has(n),
+        // Scoped pcs: [pc...] in current block that emit from this
+        // line. Empty for context lines. Used by the click handler.
+        pcs: linePcs[n] ? linePcs[n].slice() : [],
+      });
+    }
+    out.push({
+      source_file: sf,
+      source_file_raw: fileEntry.source_file_raw,
+      source_comp_dir: fileEntry.source_comp_dir,
+      lines: linesOut,
+      activeLines,
+      // Codex c2.7.4 [Medium] 2: explicit pinnedLine separates "block
+      // selection's active lines" (.has-insns highlight only) from
+      // "imark selection's pinned line" (.active strong highlight).
+      // Block selection has NO pinned line; imark selection has one.
+      pinnedLine: null,
+    });
+  }
+  return out;
+}
+
+// Source-window content for a single imark (selected control location).
+// Narrower window: just the imark's line + small context above/below.
+// Codex c2.7 design: 2 above + 3 below for imark view.
+//
+// Returns the same shape as sourceWindowForBlock but with one entry
+// (the imark's source file) and activeLines = {imark's line}.
+function sourceWindowForImark(pc, contextAbove = 2, contextBelow = 3) {
+  const idx = _ensureSourceIndex();
+  const loc = idx.pcToLoc[pc];
+  if (!loc) return [];
+  const fileEntry = idx.fileToLines[loc.source_file];
+  if (!fileEntry) return [];
+  const activeLines = new Set([loc.source_line]);
+  const lo = loc.source_line - contextAbove;
+  const hi = loc.source_line + contextBelow;
+  const linesOut = [];
+  for (let n = lo; n <= hi; n++) {
+    if (n < 1) continue;
+    if (fileEntry.lines[n] === undefined) continue;
+    linesOut.push({
+      line: n,
+      text: fileEntry.lines[n],
+      hasInsns: activeLines.has(n),
+      // Scoped pc list: only the imark itself emits from its own line
+      // in this window's scope. Empty for context lines.
+      pcs: n === loc.source_line ? [pc] : [],
+    });
+  }
+  return [{
+    source_file: loc.source_file,
+    source_file_raw: fileEntry.source_file_raw,
+    source_comp_dir: fileEntry.source_comp_dir,
+    lines: linesOut,
+    activeLines,
+    // Codex c2.7.4 [Medium] 2: imark detail has explicit pinnedLine.
+    // The renderer reads this to decide which line gets .active
+    // (strong-fill highlight); other lines get .has-insns only.
+    pinnedLine: loc.source_line,
+  }];
+}
+
+// Source-window content for a source-range selection (idea B). FILE-
+// scoped (not block-scoped) so the range captures every imark whose
+// source line falls in [startLine, endLine] for the requested
+// source_file. Lines outside [startLine, endLine] but within the
+// context radius are still rendered for grounding (e.g. show 2 lines
+// above / 2 below, like the imark/block builders), with empty pcs so
+// they're not clickable.
+//
+// Returns the same shape as sourceWindowForBlock / sourceWindowForImark
+// PLUS rangeStart / rangeEnd carried through to the renderer for the
+// .in-range visual.
+function sourceWindowForRange(source_file, startLine, endLine, contextAbove = 2, contextBelow = 2) {
+  const idx = _ensureSourceIndex();
+  const fileEntry = idx.fileToLines[source_file];
+  if (!fileEntry) return [];
+  // Per-line pcs: walk fileLineToPcs by line within the marked range.
+  // Context lines (outside [startLine, endLine]) get empty pcs.
+  const linePcs = {};
+  for (let line = startLine; line <= endLine; line++) {
+    const key = source_file + '\u0001' + line;
+    const lpcs = idx.fileLineToPcs[key];
+    if (lpcs && lpcs.length) linePcs[line] = lpcs.slice();
+  }
+  const lo = startLine - contextAbove;
+  const hi = endLine + contextBelow;
+  const linesOut = [];
+  for (let n = lo; n <= hi; n++) {
+    if (n < 1) continue;
+    if (fileEntry.lines[n] === undefined) continue;
+    linesOut.push({
+      line: n,
+      text: fileEntry.lines[n],
+      hasInsns: !!linePcs[n],
+      pcs: linePcs[n] ? linePcs[n].slice() : [],
+    });
+  }
+  return [{
+    source_file,
+    source_file_raw: fileEntry.source_file_raw,
+    source_comp_dir: fileEntry.source_comp_dir,
+    lines: linesOut,
+    activeLines: new Set(Object.keys(linePcs).map(n => parseInt(n, 10))),
+    // No single-line pin for ranges — every line in [rangeStart,
+    // rangeEnd] gets the .in-range class instead.
+    pinnedLine: null,
+    rangeStart: startLine,
+    rangeEnd: endLine,
+  }];
+}
+
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Validates that the block-granular LTS aligns with the imark LTS.
+// Returns a string description of the mismatch (truthy) on failure,
+// null on success. Checks function name, entry_addr, arch,
+// granularity tag, and that the block-address SET matches the imark
+// LTS's basic_blocks roster. Codex catch-up [Medium]: prevent silent
+// wrong-composed-effect display when files drift out of sync.
+function validateBlockLtsAlignment(imarkLts, blockLts) {
+  if (!imarkLts || !blockLts) return 'lts(s) missing';
+  const imFn = imarkLts.function_index?.[0];
+  const blFn = blockLts.function_index?.[0];
+  if (!imFn || !blFn) return 'function_index[0] missing on one or both LTSes';
+  if (imFn.name !== blFn.name) {
+    return `function name mismatch: imark=${imFn.name} block=${blFn.name}`;
+  }
+  if (imFn.entry_addr !== blFn.entry_addr) {
+    return `entry_addr mismatch: imark=${imFn.entry_addr} block=${blFn.entry_addr}`;
+  }
+  if (imarkLts.arch !== blockLts.arch) {
+    return `arch mismatch: imark=${imarkLts.arch} block=${blockLts.arch}`;
+  }
+  if (blockLts.granularity !== 'block') {
+    return `block-LTS has granularity=${JSON.stringify(blockLts.granularity)}, expected "block"`;
+  }
+  // Symmetric check on the imark LTS — catches the swapped-files
+  // case where someone drops the block-granular file into LTS_PATH
+  // and vice versa. Codex catch-up [Low].
+  if (imarkLts.granularity !== 'instruction') {
+    return `imark-LTS has granularity=${JSON.stringify(imarkLts.granularity)}, expected "instruction" (looks like LTS_PATH and BLOCK_LTS_PATH may be swapped)`;
+  }
+  // Block-address sets must match. Block-LTS's blocks list is the
+  // canonical block-addr roster for that LTS; imark's basic_blocks
+  // roster maps blocks -> imarks, with addr fields in basic_blocks.
+  const imBlocks = new Set((imFn.basic_blocks || []).map(bb => bb.addr));
+  const blBlocks = new Set(blockLts.blocks || []);
+  if (imBlocks.size !== blBlocks.size) {
+    return `block count mismatch: imark=${imBlocks.size} block=${blBlocks.size}`;
+  }
+  for (const a of imBlocks) {
+    if (!blBlocks.has(a)) {
+      return `imark block ${a} missing from block-LTS`;
+    }
+  }
+  for (const a of blBlocks) {
+    if (!imBlocks.has(a)) {
+      return `block-LTS block ${a} missing from imark roster`;
+    }
+  }
+  return null;
+}
+
+// =====================================================================
+// Start
+// =====================================================================
+
+init().then(() => {
+  // Expose for chrome-devtools debugging / future programmatic tests.
+  window.__imarkViewer = {
+    get lts() { return lts; },
+    get blockLts() { return blockLts; },
+    get pcToBlock() { return pcToBlock; },
+    get blockToImarks() { return blockToImarks; },
+    get pcToInsn() { return pcToInsn; },
+    get blockToBlockTransitions() { return blockToBlockTransitions; },
+    get cyBlock() { return cyBlock; },
+    get cyScoped() { return cyScoped; },
+    get cyFull() { return cyFull; },
+    // Old per-axis getters preserved for chrome-devtools-MCP test
+    // call sites that read these. New code should consume the
+    // unified `selected` getter directly.
+    get selectedBlock() { return selectedBlockAddr(); },
+    get selectedImark() { return selectedImarkPc(); },
+    get selected() { return selected; },
+    // Transition-index helpers exposed for debugging / future tests.
+    imarkTransitionByIdx,
+    imarkTransitionsFromSrc,
+    blockTransitionByIdx,
+    blockTransitionsFromSrc,
+    imarkTransitionId,
+    blockTransitionId,
+    selectBlock,
+    selectImark,
+    // LTS-refactor commit 2: central transition-selection helpers.
+    selectImarkTransition,
+    selectBlockTransition,
+    // c2.7.2: source-listings data-index helpers (read-only over LTS).
+    sourceLocForInstruction,
+    instructionsForSourceLine,
+    sourceWindowForBlock,
+    sourceWindowForImark,
+    // B1 (idea B): source-range selection.
+    selectSourceRange,
+    sourceWindowForRange,
+    // B2 (idea B): graph subgraph highlight helpers.
+    applySourceRangeHighlight,
+    clearSourceRangeHighlight,
+    // B3 (idea B): reusable detail-panel renderers (also used by
+    // idea A imark-range detail and c3 imark sidebar in subsequent
+    // commits).
+    renderAsmListing,
+    renderTransitionIndex,
+    // A1 (idea A): imark-range selection.
+    selectImarkRange,
+    clearImarkRangeAnchor,
+    // A2 (idea A): range classifier.
+    classifyImarkRange,
+    // A3 (idea A): block-alignment detection + composed-effect renderer.
+    isBlockAligned,
+    renderBlockComposedEffects,
+    // I.3-flavored compose_subs (sophie 2026-04-29 evening, demo arc).
+    composeSubs,
+    composeChain,
+    composeChainGuard,
+  };
+});
+</script>
+</body>
+</html>

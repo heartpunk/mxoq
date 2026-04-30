@@ -1,0 +1,50 @@
+[
+  {
+    "src": "0x40990f",
+    "kind": "exit",
+    "jumpkind": "Ijk_Boring",
+    "guard": "(bvsle ((_ extract 31 0) rax) #x00000005)",
+    "sub": {
+      "rip": "#x0000000000409918",
+      "rflags_CF": "(ite (bvule #x00000005 ((_ extract 31 0) rax)) #b0 #b1)",
+      "rflags_PF": "(let ((a!1 (bvadd #xfffffffb ((_ extract 31 0) rax))))\n  (bvxor #b1\n         (bvadd #b1 ((_ extract 0 0) rax))\n         ((_ extract 1 1) a!1)\n         ((_ extract 2 2) a!1)\n         ((_ extract 3 3) a!1)\n         ((_ extract 4 4) a!1)\n         ((_ extract 5 5) a!1)\n         ((_ extract 6 6) a!1)\n         ((_ extract 7 7) a!1)))",
+      "rflags_AF": "(bvxor ((_ extract 4 4) (bvadd #xfffffffb ((_ extract 31 0) rax)))\n       ((_ extract 4 4) rax))",
+      "rflags_ZF": "(ite (= ((_ extract 31 0) rax) #x00000005) #b1 #b0)",
+      "rflags_SF": "((_ extract 31 31) (bvadd #xfffffffb ((_ extract 31 0) rax)))",
+      "rflags_OF": "(let ((a!1 (bvxor ((_ extract 31 31) rax)\n                  ((_ extract 31 31) (bvadd #xfffffffb ((_ extract 31 0) rax))))))\n  (bvnot (bvor (bvnot ((_ extract 31 31) rax)) (bvnot a!1))))"
+    },
+    "tgt": "0x409918",
+    "exit_flag_status": {
+      "CF": "defined",
+      "ZF": "defined",
+      "SF": "defined",
+      "OF": "defined",
+      "PF": "defined",
+      "AF": "undefined"
+    }
+  },
+  {
+    "src": "0x40990f",
+    "kind": "default",
+    "jumpkind": "Ijk_Boring",
+    "guard": "(not (bvsle ((_ extract 31 0) rax) #x00000005))",
+    "sub": {
+      "rip": "#x0000000000409b14",
+      "rflags_CF": "(ite (bvule #x00000005 ((_ extract 31 0) rax)) #b0 #b1)",
+      "rflags_PF": "(let ((a!1 (bvadd #xfffffffb ((_ extract 31 0) rax))))\n  (bvxor #b1\n         (bvadd #b1 ((_ extract 0 0) rax))\n         ((_ extract 1 1) a!1)\n         ((_ extract 2 2) a!1)\n         ((_ extract 3 3) a!1)\n         ((_ extract 4 4) a!1)\n         ((_ extract 5 5) a!1)\n         ((_ extract 6 6) a!1)\n         ((_ extract 7 7) a!1)))",
+      "rflags_AF": "(bvxor ((_ extract 4 4) (bvadd #xfffffffb ((_ extract 31 0) rax)))\n       ((_ extract 4 4) rax))",
+      "rflags_ZF": "(ite (= ((_ extract 31 0) rax) #x00000005) #b1 #b0)",
+      "rflags_SF": "((_ extract 31 31) (bvadd #xfffffffb ((_ extract 31 0) rax)))",
+      "rflags_OF": "(let ((a!1 (bvxor ((_ extract 31 31) rax)\n                  ((_ extract 31 31) (bvadd #xfffffffb ((_ extract 31 0) rax))))))\n  (bvnot (bvor (bvnot ((_ extract 31 31) rax)) (bvnot a!1))))"
+    },
+    "tgt": "0x409b14",
+    "exit_flag_status": {
+      "CF": "defined",
+      "ZF": "defined",
+      "SF": "defined",
+      "OF": "defined",
+      "PF": "defined",
+      "AF": "undefined"
+    }
+  }
+]
