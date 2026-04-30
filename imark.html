@@ -1426,16 +1426,24 @@ function rebuildScopedImarkGraph(blockAddr) {
       return;
     }
     const pc = data.id;
-    // A1 (idea A): shift-click → imark-range selection. Two-step UX
-    // mirroring B's source-line range: first shift-click sets the
-    // anchor without navigating; second shift-click in the same block
-    // forms the range. Cross-block shift-click resets the anchor (idea
-    // A is block-scoped in v0).
+    // A1 (idea A) + UX fix (2026-04-29 evening): shift-click → imark-
+    // range selection. Two anchor sources, in priority order:
+    //   1. _imarkClickAnchor (set by a prior shift-click)
+    //   2. selected.pc (when the user has a single-imark selection and
+    //      shift-clicks a sibling — file-manager convention "click A,
+    //      shift-click B = range A..B").
+    // Falls through to plain-click semantics if neither yields an
+    // anchor in the same block.
     const shiftKey = !!(evt.originalEvent && evt.originalEvent.shiftKey);
     if (shiftKey) {
-      const anchorBlock = _imarkClickAnchor ? pcToBlock[_imarkClickAnchor] : null;
+      const implicitAnchor =
+        (selected && selected.type === 'imark-node' && selected.pc) ? selected.pc : null;
+      const effectiveAnchor = _imarkClickAnchor || implicitAnchor;
+      const anchorBlock = effectiveAnchor ? pcToBlock[effectiveAnchor] : null;
       const clickBlock = pcToBlock[pc];
-      if (!_imarkClickAnchor || anchorBlock !== clickBlock) {
+      if (!effectiveAnchor || anchorBlock !== clickBlock) {
+        // First shift-click in this block (no anchor or different
+        // block): set anchor only, don't form range yet.
         _imarkClickAnchor = pc;
         cyScoped.elements('.shift-anchor').removeClass('shift-anchor');
         if (cyFull) cyFull.elements('.shift-anchor').removeClass('shift-anchor');
@@ -1444,7 +1452,9 @@ function rebuildScopedImarkGraph(blockAddr) {
         if (fullNode && fullNode.length) fullNode.addClass('shift-anchor');
         return;
       }
-      selectImarkRange(_imarkClickAnchor, pc, { source: 'scoped-shift' });
+      // Anchor exists (explicit or implicit) and is in the same block:
+      // form range.
+      selectImarkRange(effectiveAnchor, pc, { source: 'scoped-shift' });
       return;
     }
     selectImark(pc, { source: 'scoped' });
@@ -1525,14 +1535,17 @@ function buildFullImarkGraph() {
     const data = evt.target.data();
     if (data.isStub) return;
     const pc = data.id;
-    // A1 (idea A): shift-click in cyFull mirrors cyScoped's two-step
-    // shift-click range UX. Anchor is cross-graph: setting it on one
-    // graph applies the visual to the same pc-id node on the other.
+    // A1 + UX fix (2026-04-29 evening): same anchor priority as
+    // cyScoped — explicit _imarkClickAnchor first, fall back to
+    // selected.pc when a single imark is already selected.
     const shiftKey = !!(evt.originalEvent && evt.originalEvent.shiftKey);
     if (shiftKey) {
-      const anchorBlock = _imarkClickAnchor ? pcToBlock[_imarkClickAnchor] : null;
+      const implicitAnchor =
+        (selected && selected.type === 'imark-node' && selected.pc) ? selected.pc : null;
+      const effectiveAnchor = _imarkClickAnchor || implicitAnchor;
+      const anchorBlock = effectiveAnchor ? pcToBlock[effectiveAnchor] : null;
       const clickBlock = pcToBlock[pc];
-      if (!_imarkClickAnchor || anchorBlock !== clickBlock) {
+      if (!effectiveAnchor || anchorBlock !== clickBlock) {
         _imarkClickAnchor = pc;
         if (cyScoped) cyScoped.elements('.shift-anchor').removeClass('shift-anchor');
         cyFull.elements('.shift-anchor').removeClass('shift-anchor');
@@ -1541,7 +1554,7 @@ function buildFullImarkGraph() {
         if (scopedNode && scopedNode.length) scopedNode.addClass('shift-anchor');
         return;
       }
-      selectImarkRange(_imarkClickAnchor, pc, { source: 'full-shift' });
+      selectImarkRange(effectiveAnchor, pc, { source: 'full-shift' });
       return;
     }
     selectImark(pc, { source: 'full' });
@@ -4241,6 +4254,9 @@ init().then(() => {
     // A1 (idea A): imark-range selection.
     selectImarkRange,
     clearImarkRangeAnchor,
+    // Debug: expose the imark-range anchor module variable. Mostly
+    // useful during shift-click UX testing.
+    get _imarkClickAnchor() { return _imarkClickAnchor; },
     // A2 (idea A): range classifier.
     classifyImarkRange,
     // A3 (idea A): block-alignment detection + composed-effect renderer.
