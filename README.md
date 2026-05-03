@@ -10,9 +10,31 @@ a guard plus a parallel state-update over the quantifier-free
 bitvector + array fragment of SMT-LIB that every modern solver
 speaks.
 
-The output is an *executable specification* of the function. We've
-implemented a Lean executor (~1,580 LoC across `QfabvLean/`) that
-loads the JSON and runs it.
+The output is an *executable specification* of the function —
+engine-agnostic by design. We've built one Lean executor
+(~1,580 LoC across `QfabvLean/`) that loads the JSON and runs it;
+the schema is intended to be consumed by other runtimes, formal
+frameworks, or domain-specific analyses too.
+
+## The methodology
+
+The pitch is engine-agnostic. Any symbolic execution engine can be
+turned into an extractor by *diffing path conditions before and
+after each step*: the difference IS the per-step relational
+transformer. Composing those transformers across the CFG gives a
+labelled transition system whose edges encode (guard, sub) atoms in
+the QF_ABV fragment. That LTS is the IR.
+
+The angr backend in this gist is one realization. The methodology
+itself is the diff-path-conditions extraction trick and the LTS
+shape, not any particular extractor.
+
+From the IR, you lift downstream: EBNF (parser-grammar), K-framework
+(term rewriting + grammar), TLA+ (distributed protocols), and
+domain-specific abstract interpretations. We've done concrete
+extraction for terminal emulators (libtsm), crypto digests
+(libmd/sha1), and an interpreter dispatch loop (lua); EBNF and
+K-framework lifts are next.
 
 ## What's in this gist
 
@@ -121,13 +143,14 @@ A few specifics worth naming:
   re-raise as `AngrBackendNotImplemented`. Partial-flag output is
   not a failure mode.
 
-This is the **pedagogically-minimal** version of the extractor. We
-also maintain a larger handwritten VEX→SMT translator (~1500
-lines) for cross-validation in the parent codebase, but it
-re-implements amd64 instruction semantics that angr already has
-helpers for. The smaller-core shape is recent — earlier
-iterations of this work didn't have it because we hadn't yet found
-the right factoring.
+This is the **pedagogically-minimal** version of the extractor.
+The smaller-core shape is recent: earlier pipeline iterations
+bundled extraction with specific downstream analyses (closure
+construction, partition refinement, dispatch-loop fixpoints), which
+made the construction harder to evaluate as a methodology in its
+own right. The current factoring decouples extraction (what's in
+this gist) from analysis (downstream consumers of the LTS); that
+decoupling is what makes the methodology engine-agnostic.
 
 ## Walkthrough — one block
 
@@ -508,6 +531,25 @@ load-bearing:
   `sub_trace_app` and `pc_trace_app` at `Programs.v:322` and
   `Programs.v:341` are the trace-algebra restatement.)
 
+## Trust boundary
+
+The recording is structurally trivial: we observe angr's per-block
+`(guard, sub)` output and write it into our LTS schema. The lift is
+*not* a translation step — there's no semantic transformation we
+are responsible for.
+
+Trust boundary is at angr+pyvex, the same boundary as Park et al.
+2025 ("Filtered simulation," compositional binary lifting). Our
+formal claims discharge against angr+pyvex correctness, not against
+any logic of our own.
+
+Concrete-semantic preservation of the lift is *empirically*
+validated on real targets (see below). Symbolic and denotational
+preservation are claims supported by structural correspondence —
+each VEX statement maps to one ICTAC (guard, sub) atom in the
+schema — and would, if formalized, reduce to the angr+pyvex
+correctness claim.
+
 ## Empirical validation
 
 For `tsm_utf8_mach_feed` specifically: on **2265 hand-picked +
@@ -522,3 +564,36 @@ So the block above, times 36 more like it, composed through the CFG
 and executed transition-by-transition under concrete inputs,
 recovers the full observable behavior of the function. That's the
 claim; that's the test that backs it.
+
+## What this enables: parser, opsem, bridge
+
+For source-level systems (interpreters, parsers, bytecode VMs)
+the IR carries enough structure to recover behavior at three
+distinct layers, *as separate sub-extractions, each requiring its
+own follow-up analysis*:
+
+1. **Parser** — the LTS of the parser itself. Lifts to EBNF (or
+   richer grammar formalisms) by a path-conditions-as-symbolic
+   approach: extract the parser, derive the grammar's covering
+   sets, symbolically execute over them, and read syntactic
+   positions off the resulting path constraints.
+
+2. **Operational semantics** — for a bytecode VM, the LTS of the
+   dispatch loop plus the per-handler LTSs (one per opcode, when
+   extracted out). For compiled languages, the equivalent control
+   flow.
+
+3. **Bridge** — the data-flow + typing + control-flow paths that
+   relate AST shape to dispatched code. Says "this AST production
+   maps to that opcode handler's behavioral equivalence class."
+
+For source-level systems where all three sub-extractions are
+present, the construction of a K-framework rule can be described as
+a JOIN over them: anchor on a particular opcode handler in the
+dispatch loop, query which AST shapes correspond to its equivalence
+class of behavior, and the JOIN result has the ingredients of the
+K rule's LHS-RHS pair (in K's syntax-as-term-structure style).
+
+We've done concrete bytecode-VM extraction on lua. EBNF and
+K-framework lifts are not yet shown in this gist; they're the next
+demonstrations.
